@@ -9,7 +9,7 @@
   },
   {
     "name": "Fabric Modded",
-    "version_id": "26.1",
+    "version_id": "1.21.4",
     "loader": "Fabric",
     "loader_version": "LatestStable",
     "color_mode": "Auto",

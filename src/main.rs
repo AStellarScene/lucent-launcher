@@ -2,12 +2,13 @@ use adw::prelude::*;
 use adw::{ActionRow, Application, ApplicationWindow, BottomSheet, EntryRow};
 use gtk::{
     Box as GtkBox, Button, CheckButton, CssProvider, DropDown, Entry as GtkEntry, FlowBox, Frame,
-    GestureClick, Label, Orientation, Picture, ProgressBar, Stack, StringList, Switch, TextView,
+    GestureClick, Label, Orientation, ProgressBar, Stack, StringList, Switch, TextView,
 };
 use keyring::{Entry, Error as KeyringError};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha1::{Digest, Sha1};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -29,6 +30,9 @@ const DEFAULT_MS_REDIRECT_URI: &str = "http://localhost:53682/callback";
 const KEYRING_SERVICE: &str = "com.lucentlauncher";
 const KEYRING_ACCOUNT: &str = "microsoft-refresh-token";
 const PROFILES_FILE_NAME: &str = "profiles.json";
+const UI_RESOURCE_PATH: &str = "/com/lucentlauncher/ui/launcher.ui";
+const DATA_DIR_ENV: &str = "LUCENT_DATA_DIR";
+const APP_DATA_SUBDIR: &str = "lucent-launcher";
 
 #[derive(Clone)]
 enum Session {
@@ -89,6 +93,18 @@ struct LauncherProfile {
     color_mode: ProfileColorMode,
     #[serde(default)]
     color_hex: Option<String>,
+    #[serde(default)]
+    java_binary: Option<String>,
+    #[serde(default = "default_java_auto_download")]
+    java_auto_download: bool,
+    #[serde(default)]
+    java_memory_mb: Option<u32>,
+    #[serde(default)]
+    java_args: Option<String>,
+}
+
+fn default_java_auto_download() -> bool {
+    true
 }
 
 impl LauncherProfile {
@@ -100,6 +116,10 @@ impl LauncherProfile {
             loader_version: ProfileLoaderVersion::LatestStable,
             color_mode: ProfileColorMode::Auto,
             color_hex: None,
+            java_binary: None,
+            java_auto_download: true,
+            java_memory_mb: None,
+            java_args: None,
         }
     }
 
@@ -120,6 +140,73 @@ impl LauncherProfile {
             ProfileLoaderVersion::Exact(v) => format!("Exact({v})"),
         }
     }
+}
+
+fn parse_optional_u32(value: &str) -> Option<u32> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        trimmed.parse::<u32>().ok()
+    }
+}
+
+fn normalize_optional_text(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn parse_extra_jvm_arguments(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split_whitespace()
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn apply_profile_runtime_jvm_overrides(
+    args: &mut Vec<String>,
+    main_class: Option<&str>,
+    memory_mb: Option<u32>,
+    extra_args: Option<&str>,
+) -> usize {
+    let mut insert_args: Vec<String> = Vec::new();
+
+    if let Some(mb) = memory_mb.filter(|v| *v > 0) {
+        insert_args.push(format!("-Xmx{mb}M"));
+    }
+    insert_args.extend(parse_extra_jvm_arguments(extra_args));
+
+    if insert_args.is_empty() {
+        return 0;
+    }
+
+    let mut main_idx = main_class
+        .and_then(|main| args.iter().position(|a| a == main))
+        .unwrap_or(args.len());
+
+    if memory_mb.is_some() {
+        let before_main = &args[..main_idx];
+        let mut retained = Vec::with_capacity(before_main.len());
+        for arg in before_main {
+            if !arg.starts_with("-Xmx") {
+                retained.push(arg.clone());
+            }
+        }
+        let removed = before_main.len().saturating_sub(retained.len());
+        if removed > 0 {
+            let mut rebuilt = retained;
+            rebuilt.extend_from_slice(&args[main_idx..]);
+            *args = rebuilt;
+            main_idx = main_idx.saturating_sub(removed);
+        }
+    }
+
+    args.splice(main_idx..main_idx, insert_args.clone());
+    insert_args.len()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,7 +248,6 @@ struct ModrinthSearchHitRaw {
     project_id: String,
     title: String,
     description: Option<String>,
-    icon_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -169,7 +255,6 @@ struct DiscoveryCardData {
     project_id: String,
     title: String,
     description: String,
-    icon_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -181,6 +266,8 @@ struct InstalledContentEntry {
 
 #[derive(Debug, Clone, Deserialize)]
 struct ModrinthVersion {
+    #[serde(default)]
+    project_id: Option<String>,
     game_versions: Vec<String>,
     loaders: Vec<String>,
     files: Vec<ModrinthVersionFile>,
@@ -191,6 +278,15 @@ struct ModrinthVersionFile {
     url: String,
     filename: String,
     primary: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct ModRepairSummary {
+    checked: usize,
+    updated: usize,
+    disabled: usize,
+    unknown: usize,
+    disabled_mods: Vec<String>,
 }
 
 // Messages sent from worker threads back to UI thread.
@@ -226,6 +322,10 @@ enum LauncherMessage {
 }
 
 fn main() {
+    if let Err(e) = gtk::gio::resources_register_include!("lucent-launcher.gresource") {
+        panic!("failed registering embedded UI resources: {e}");
+    }
+
     let app = Application::builder()
         .application_id("com.lucentlauncher")
         .build();
@@ -264,10 +364,80 @@ fn clear_refresh_token() -> Result<(), String> {
     }
 }
 
+fn resolve_runtime_base_dir() -> Result<PathBuf, String> {
+    if let Ok(override_dir) = std::env::var(DATA_DIR_ENV) {
+        let trimmed = override_dir.trim();
+        if !trimmed.is_empty() {
+            let path = PathBuf::from(trimmed);
+            fs::create_dir_all(&path)
+                .map_err(|e| format!("failed creating runtime dir '{}': {e}", path.display()))?;
+            return Ok(path);
+        }
+    }
+
+    let legacy_base = std::env::current_dir()
+        .map_err(|e| format!("failed resolving current dir for runtime fallback: {e}"))?;
+
+    let mut preferred_base = dirs::data_local_dir()
+        .or_else(dirs::data_dir)
+        .unwrap_or_else(|| legacy_base.clone());
+    preferred_base.push(APP_DATA_SUBDIR);
+
+    fs::create_dir_all(&preferred_base).map_err(|e| {
+        format!(
+            "failed creating app data runtime dir '{}': {e}",
+            preferred_base.display()
+        )
+    })?;
+
+    let preferred_has_data = preferred_base.join(PROFILES_FILE_NAME).exists()
+        || preferred_base.join(".minecraft").exists();
+    let legacy_has_data = legacy_base.join(PROFILES_FILE_NAME).exists()
+        || legacy_base.join(".minecraft").exists();
+
+    if !preferred_has_data && legacy_has_data {
+        let legacy_profiles = legacy_base.join(PROFILES_FILE_NAME);
+        let preferred_profiles = preferred_base.join(PROFILES_FILE_NAME);
+        if legacy_profiles.exists() && !preferred_profiles.exists() {
+            fs::copy(&legacy_profiles, &preferred_profiles).map_err(|e| {
+                format!(
+                    "failed migrating legacy profiles '{}' -> '{}': {e}",
+                    legacy_profiles.display(),
+                    preferred_profiles.display()
+                )
+            })?;
+        }
+
+        let legacy_mc = legacy_base.join(".minecraft");
+        let preferred_mc = preferred_base.join(".minecraft");
+        if legacy_mc.exists() && !preferred_mc.exists() {
+            if let Err(e) = fs::rename(&legacy_mc, &preferred_mc) {
+                eprintln!(
+                    "[WARN] Failed migrating legacy .minecraft dir '{}' -> '{}': {e}. Falling back to legacy runtime path.",
+                    legacy_mc.display(),
+                    preferred_mc.display()
+                );
+                return Ok(legacy_base);
+            }
+        }
+    }
+
+    Ok(preferred_base)
+}
+
+fn runtime_base_dir() -> Result<PathBuf, String> {
+    resolve_runtime_base_dir()
+}
+
+fn minecraft_root_dir() -> Result<PathBuf, String> {
+    let root = runtime_base_dir()?.join(".minecraft");
+    fs::create_dir_all(&root)
+        .map_err(|e| format!("failed creating minecraft dir '{}': {e}", root.display()))?;
+    Ok(root)
+}
+
 fn profiles_file_path() -> Result<PathBuf, String> {
-    std::env::current_dir()
-        .map(|dir| dir.join(PROFILES_FILE_NAME))
-        .map_err(|e| format!("failed resolving profiles path: {e}"))
+    Ok(runtime_base_dir()?.join(PROFILES_FILE_NAME))
 }
 
 fn load_profiles_from_disk() -> Result<Vec<LauncherProfile>, String> {
@@ -466,6 +636,11 @@ fn ensure_discovery_card_css(frame: &Frame) {
         }
         .discovery-card > border {
             border-radius: 12px;
+        }
+        .discovery-select-check check {
+            min-width: 18px;
+            min-height: 18px;
+            border-radius: 3px;
         }";
 
     let provider = CssProvider::new();
@@ -490,9 +665,7 @@ fn sanitize_component_for_path(input: &str) -> String {
 }
 
 fn profile_game_directory(profile: &LauncherProfile) -> Result<PathBuf, String> {
-    let root = std::env::current_dir()
-        .map_err(|e| format!("failed resolving project dir: {e}"))?
-        .join(".minecraft")
+    let root = minecraft_root_dir()?
         .join("profiles")
         .join(sanitize_component_for_path(&profile.name));
     fs::create_dir_all(&root).map_err(|e| format!("failed creating '{}': {e}", root.display()))?;
@@ -606,47 +779,20 @@ fn delete_profile_content(
     Ok(())
 }
 
-fn cache_modrinth_icon(icon_url: &str, project_id: &str) -> Option<String> {
-    let cache_dir = std::env::current_dir()
-        .ok()?
-        .join(".minecraft")
-        .join("cache")
-        .join("modrinth-icons");
-    if fs::create_dir_all(&cache_dir).is_err() {
-        return None;
-    }
-
-    let ext = icon_url
-        .split('?')
-        .next()
-        .and_then(|p| Path::new(p).extension())
-        .and_then(|e| e.to_str())
-        .filter(|e| !e.is_empty())
-        .unwrap_or("png");
-
-    let path = cache_dir.join(format!("{}.{ext}", sanitize_component_for_path(project_id)));
-    if !path.exists() {
-        let bytes = Client::new()
-            .get(icon_url)
-            .header("User-Agent", "LucentLauncher/0.1 (Modrinth integration)")
-            .send()
-            .ok()?
-            .error_for_status()
-            .ok()?
-            .bytes()
-            .ok()?;
-        if fs::write(&path, bytes).is_err() {
-            return None;
-        }
-    }
-
-    Some(path.to_string_lossy().to_string())
-}
-
 fn fetch_modrinth_projects(
     kind: DiscoveryKind,
     query: &str,
+    profile: Option<&LauncherProfile>,
 ) -> Result<Vec<DiscoveryCardData>, String> {
+    if kind == DiscoveryKind::Mods {
+        let Some(profile) = profile else {
+            return Err("Mod search requires an active profile context".to_string());
+        };
+        if profile.loader == ProfileLoader::Vanilla {
+            return Ok(Vec::new());
+        }
+    }
+
     let facets = format!("[[\"project_type:{}\"]]", kind.project_type_facet());
 
     let mut url = url::Url::parse("https://api.modrinth.com/v2/search")
@@ -671,21 +817,30 @@ fn fetch_modrinth_projects(
         .json::<ModrinthSearchResponse>()
         .map_err(|e| format!("Modrinth search decode failed: {e}"))?;
 
-    Ok(payload
+    let mut results: Vec<DiscoveryCardData> = payload
         .hits
         .into_iter()
         .map(|hit| DiscoveryCardData {
-            icon_path: hit
-                .icon_url
-                .as_deref()
-                .and_then(|u| cache_modrinth_icon(u, &hit.project_id)),
             project_id: hit.project_id,
             title: hit.title,
             description: hit
                 .description
                 .unwrap_or_else(|| "No description available.".to_string()),
         })
-        .collect())
+        .collect();
+
+    if kind == DiscoveryKind::Mods {
+        let profile = profile.expect("validated above");
+        let mut filtered = Vec::new();
+        for item in results {
+            if fetch_compatible_modrinth_version_for_project(&item.project_id, profile)?.is_some() {
+                filtered.push(item);
+            }
+        }
+        results = filtered;
+    }
+
+    Ok(results)
 }
 
 fn profile_loader_to_modrinth_loader(profile: &LauncherProfile) -> Option<&'static str> {
@@ -696,6 +851,313 @@ fn profile_loader_to_modrinth_loader(profile: &LauncherProfile) -> Option<&'stat
         ProfileLoader::Forge => Some("forge"),
         ProfileLoader::NeoForge => Some("neoforge"),
     }
+}
+
+fn profile_loader_modrinth_loaders(profile: &LauncherProfile) -> Vec<&'static str> {
+    match profile.loader {
+        ProfileLoader::Vanilla => Vec::new(),
+        ProfileLoader::Fabric => vec!["fabric"],
+        ProfileLoader::Quilt => vec!["quilt", "fabric"],
+        ProfileLoader::Forge => vec!["forge"],
+        ProfileLoader::NeoForge => vec!["neoforge", "forge"],
+    }
+}
+
+fn is_modrinth_version_compatible(version: &ModrinthVersion, profile: &LauncherProfile) -> bool {
+    if !version.game_versions.iter().any(|v| v == &profile.version_id) {
+        return false;
+    }
+
+    let required_loaders = profile_loader_modrinth_loaders(profile);
+    if required_loaders.is_empty() {
+        return false;
+    }
+
+    version.loaders.iter().any(|loader| {
+        required_loaders
+            .iter()
+            .any(|required| loader.eq_ignore_ascii_case(required))
+    })
+}
+
+fn sha1_file_hex(path: &Path) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|e| format!("failed reading '{}': {e}", path.display()))?;
+    let mut hasher = Sha1::new();
+    hasher.update(&bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn fetch_modrinth_version_by_hash(hash: &str) -> Result<Option<ModrinthVersion>, String> {
+    let mut url = url::Url::parse(&format!("https://api.modrinth.com/v2/version_file/{hash}"))
+        .map_err(|e| format!("failed to build Modrinth version lookup URL: {e}"))?;
+    {
+        let mut qp = url.query_pairs_mut();
+        qp.append_pair("algorithm", "sha1");
+    }
+
+    let response = Client::new()
+        .get(url)
+        .header("User-Agent", "LucentLauncher/0.1 (Modrinth integration)")
+        .send()
+        .map_err(|e| format!("failed querying Modrinth version by hash: {e}"))?;
+
+    if response.status().as_u16() == 404 {
+        return Ok(None);
+    }
+
+    let response = response
+        .error_for_status()
+        .map_err(|e| format!("Modrinth version hash lookup failed: {e}"))?;
+
+    response
+        .json::<ModrinthVersion>()
+        .map(Some)
+        .map_err(|e| format!("failed decoding Modrinth version hash payload: {e}"))
+}
+
+fn fetch_modrinth_compatible_update_for_hash(
+    hash: &str,
+    profile: &LauncherProfile,
+) -> Result<Option<ModrinthVersion>, String> {
+    let loaders = serde_json::to_string(&profile_loader_modrinth_loaders(profile))
+        .map_err(|e| format!("failed serializing loader filter: {e}"))?;
+    let versions = serde_json::to_string(&vec![profile.version_id.clone()])
+        .map_err(|e| format!("failed serializing game version filter: {e}"))?;
+
+    let mut url = url::Url::parse(&format!(
+        "https://api.modrinth.com/v2/version_file/{hash}/update"
+    ))
+    .map_err(|e| format!("failed to build Modrinth update lookup URL: {e}"))?;
+    {
+        let mut qp = url.query_pairs_mut();
+        qp.append_pair("algorithm", "sha1");
+        qp.append_pair("loaders", &loaders);
+        qp.append_pair("game_versions", &versions);
+    }
+
+    let response = Client::new()
+        .get(url)
+        .header("User-Agent", "LucentLauncher/0.1 (Modrinth integration)")
+        .send()
+        .map_err(|e| format!("failed querying Modrinth update by hash: {e}"))?;
+
+    if response.status().as_u16() == 404 {
+        return Ok(None);
+    }
+
+    let response = response
+        .error_for_status()
+        .map_err(|e| format!("Modrinth update hash lookup failed: {e}"))?;
+
+    response
+        .json::<ModrinthVersion>()
+        .map(Some)
+        .map_err(|e| format!("failed decoding Modrinth update hash payload: {e}"))
+}
+
+fn fetch_compatible_modrinth_version_for_project(
+    project_id: &str,
+    profile: &LauncherProfile,
+) -> Result<Option<ModrinthVersion>, String> {
+    let versions_url = url::Url::parse(&format!(
+        "https://api.modrinth.com/v2/project/{project_id}/version"
+    ))
+    .map_err(|e| format!("failed to build Modrinth project versions URL: {e}"))?;
+
+    let versions = Client::new()
+        .get(versions_url)
+        .header("User-Agent", "LucentLauncher/0.1 (Modrinth integration)")
+        .send()
+        .map_err(|e| format!("failed requesting Modrinth project versions: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("failed fetching Modrinth project versions: {e}"))?
+        .json::<Vec<ModrinthVersion>>()
+        .map_err(|e| format!("failed decoding Modrinth project versions: {e}"))?;
+
+    Ok(versions
+        .into_iter()
+        .find(|version| is_modrinth_version_compatible(version, profile) && !version.files.is_empty()))
+}
+
+fn disable_mod_file(path: &Path) -> Result<PathBuf, String> {
+    let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+        return Err(format!("failed resolving filename for '{}'", path.display()));
+    };
+
+    let disabled_path = path.with_file_name(format!("{file_name}.disabled"));
+    fs::rename(path, &disabled_path).map_err(|e| {
+        format!(
+            "failed disabling incompatible mod '{}': {e}",
+            path.display()
+        )
+    })?;
+    Ok(disabled_path)
+}
+
+fn apply_modrinth_update_to_mod_path(
+    update: ModrinthVersion,
+    existing_path: &Path,
+) -> Result<PathBuf, String> {
+    let file = update
+        .files
+        .iter()
+        .find(|f| f.primary.unwrap_or(false))
+        .or_else(|| update.files.first())
+        .ok_or_else(|| "Modrinth update payload had no downloadable files".to_string())?;
+
+    let target_path = existing_path
+        .parent()
+        .ok_or_else(|| format!("failed resolving parent dir for '{}'", existing_path.display()))?
+        .join(sanitize_component_for_path(&file.filename));
+
+    let bytes = Client::new()
+        .get(&file.url)
+        .header("User-Agent", "LucentLauncher/0.1 (Modrinth integration)")
+        .send()
+        .map_err(|e| format!("failed downloading compatible mod update: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("compatible mod update download failed: {e}"))?
+        .bytes()
+        .map_err(|e| format!("failed reading compatible mod update bytes: {e}"))?;
+
+    fs::write(&target_path, bytes)
+        .map_err(|e| format!("failed writing '{}': {e}", target_path.display()))?;
+
+    if target_path != existing_path {
+        fs::remove_file(existing_path).map_err(|e| {
+            format!(
+                "failed removing old incompatible mod '{}': {e}",
+                existing_path.display()
+            )
+        })?;
+    }
+
+    Ok(target_path)
+}
+
+fn auto_repair_profile_mods(
+    profile: &LauncherProfile,
+    tx: &mpsc::Sender<LauncherMessage>,
+) -> Result<ModRepairSummary, String> {
+    let mods_dir = profile_content_dir(profile, DiscoveryKind::Mods)?;
+    let mut summary = ModRepairSummary {
+        checked: 0,
+        updated: 0,
+        disabled: 0,
+        unknown: 0,
+        disabled_mods: Vec::new(),
+    };
+
+    let mut enabled_mods = Vec::new();
+    for entry in fs::read_dir(&mods_dir)
+        .map_err(|e| format!("failed reading '{}': {e}", mods_dir.display()))?
+    {
+        let entry = entry.map_err(|e| format!("failed iterating '{}': {e}", mods_dir.display()))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.ends_with(".disabled") {
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("jar") {
+            continue;
+        }
+        enabled_mods.push(path);
+    }
+
+    if enabled_mods.is_empty() {
+        return Ok(summary);
+    }
+
+    let _ = tx.send(LauncherMessage::Log(format!(
+        "Auto-repair: checking {} enabled mod(s) for compatibility (MC {}, loader {})",
+        enabled_mods.len(),
+        profile.version_id,
+        profile.loader_label()
+    )));
+
+    let mut pending_disable: Vec<PathBuf> = Vec::new();
+
+    for mod_path in enabled_mods {
+        summary.checked += 1;
+        let mod_name = mod_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("<unknown>")
+            .to_string();
+
+        let hash = sha1_file_hex(&mod_path)?;
+        let current_version = fetch_modrinth_version_by_hash(&hash)?;
+
+        match current_version {
+            None => {
+                summary.unknown += 1;
+                let _ = tx.send(LauncherMessage::Log(format!(
+                    "Auto-repair: '{}' not found on Modrinth hash index; leaving enabled",
+                    mod_name
+                )));
+            }
+            Some(version) if is_modrinth_version_compatible(&version, profile) => {
+                let _ = tx.send(LauncherMessage::Log(format!(
+                    "Auto-repair: '{}' is compatible",
+                    mod_name
+                )));
+            }
+            Some(version) => {
+                let _ = tx.send(LauncherMessage::Log(format!(
+                    "Auto-repair: '{}' is incompatible, searching same-mod compatible replacement...",
+                    mod_name
+                )));
+
+                let replacement = fetch_modrinth_compatible_update_for_hash(&hash, profile)?
+                    .or_else(|| {
+                        version.project_id.as_deref().and_then(|project_id| {
+                            fetch_compatible_modrinth_version_for_project(project_id, profile).ok().flatten()
+                        })
+                    });
+
+                if let Some(update) = replacement {
+                    let updated_path = apply_modrinth_update_to_mod_path(update, &mod_path)?;
+                    summary.updated += 1;
+                    let updated_name = updated_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("<unknown>");
+                    let _ = tx.send(LauncherMessage::Log(format!(
+                        "Auto-repair: replaced '{}' with compatible '{}'",
+                        mod_name, updated_name
+                    )));
+                } else {
+                    let _ = tx.send(LauncherMessage::Log(format!(
+                        "Auto-repair: no compatible replacement found for '{}'; will disable after retrieval phase",
+                        mod_name
+                    )));
+                    pending_disable.push(mod_path);
+                }
+            }
+        }
+    }
+
+    for mod_path in pending_disable {
+        let disabled_path = disable_mod_file(&mod_path)?;
+        summary.disabled += 1;
+        let disabled_name = disabled_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("<unknown>")
+            .to_string();
+        summary.disabled_mods.push(disabled_name.clone());
+        let _ = tx.send(LauncherMessage::Log(format!(
+            "Auto-repair: disabled incompatible mod '{}'",
+            disabled_name
+        )));
+    }
+
+    Ok(summary)
 }
 
 fn install_modrinth_project(
@@ -1555,7 +2017,7 @@ fn spawn_microsoft_refresh_flow(
 fn build_ui(app: &Application) {
     let builder = gtk::Builder::new();
     builder
-        .add_from_file("src/ui/launcher.ui")
+        .add_from_resource(UI_RESOURCE_PATH)
         .expect("Failed to load launcher UI file");
 
     // --- Core Widget References ---
@@ -1584,6 +2046,13 @@ fn build_ui(app: &Application) {
     let row_profile_color_hex: EntryRow = builder.object("row_profile_color_hex").unwrap();
     let row_account_status: ActionRow = builder.object("row_account_status").unwrap();
     let row_java_binary: EntryRow = builder.object("row_java_binary").unwrap();
+    let dropdown_profile_runtime_java_policy: DropDown = builder
+        .object("dropdown_profile_runtime_java_policy")
+        .unwrap();
+    let row_profile_runtime_memory_mb: EntryRow =
+        builder.object("row_profile_runtime_memory_mb").unwrap();
+    let row_profile_runtime_jvm_args: EntryRow =
+        builder.object("row_profile_runtime_jvm_args").unwrap();
     let lbl_welcome_user: Label = builder.object("lbl_welcome_user").unwrap();
     let lbl_ready_status: Label = builder.object("lbl_ready_status").unwrap();
     let text_view: TextView = builder.object("text_view").unwrap();
@@ -1661,6 +2130,14 @@ fn build_ui(app: &Application) {
     dropdown_profile_color_mode.set_selected(0);
     dropdown_profile_color_mode.set_sensitive(false);
     row_profile_color_hex.set_sensitive(false);
+
+    let runtime_java_policy_model = StringList::new(&["Auto", "Never"]);
+    dropdown_profile_runtime_java_policy.set_model(Some(&runtime_java_policy_model));
+    dropdown_profile_runtime_java_policy.set_selected(0);
+    dropdown_profile_runtime_java_policy.set_sensitive(false);
+    row_java_binary.set_sensitive(false);
+    row_profile_runtime_memory_mb.set_sensitive(false);
+    row_profile_runtime_jvm_args.set_sensitive(false);
 
     let profile_loading_model = StringList::new(&["No profiles"]);
     dropdown_profile_launch.set_model(Some(&profile_loading_model));
@@ -1754,20 +2231,108 @@ fn build_ui(app: &Application) {
     let mods_installed: Rc<RefCell<Vec<InstalledContentEntry>>> = Rc::new(RefCell::new(Vec::new()));
     let shaders_installed: Rc<RefCell<Vec<InstalledContentEntry>>> =
         Rc::new(RefCell::new(Vec::new()));
-    let selected_mod_project_indices: Rc<RefCell<HashSet<usize>>> =
-        Rc::new(RefCell::new(HashSet::new()));
-    let selected_shader_project_indices: Rc<RefCell<HashSet<usize>>> =
-        Rc::new(RefCell::new(HashSet::new()));
+    let selected_mod_projects: Rc<RefCell<HashMap<String, DiscoveryCardData>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+    let selected_shader_projects: Rc<RefCell<HashMap<String, DiscoveryCardData>>> =
+        Rc::new(RefCell::new(HashMap::new()));
 
     let mods_results_render = mods_results.clone();
     let flow_mods_results_render = flow_profile_mods_results.clone();
-    let selected_mod_project_indices_render = selected_mod_project_indices.clone();
+    let selected_mod_projects_render = selected_mod_projects.clone();
+    let render_mods_cards_holder: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+    let render_mods_cards_holder_for_init = render_mods_cards_holder.clone();
     let render_mods_cards: Rc<dyn Fn()> = Rc::new(move || {
         while let Some(child) = flow_mods_results_render.first_child() {
             flow_mods_results_render.remove(&child);
         }
 
-        for (idx, item) in mods_results_render.borrow().iter().enumerate() {
+        let mut selected_items: Vec<DiscoveryCardData> =
+            selected_mod_projects_render.borrow().values().cloned().collect();
+        selected_items.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+
+        if !selected_items.is_empty() {
+            let selected_header = Label::new(Some("Selected for install"));
+            selected_header.set_xalign(0.0);
+            selected_header.add_css_class("heading");
+            flow_mods_results_render.insert(&selected_header, -1);
+
+            for item in selected_items {
+                let frame = Frame::new(None);
+                frame.set_hexpand(true);
+                frame.set_valign(gtk::Align::Start);
+                ensure_discovery_card_css(&frame);
+
+                let row = GtkBox::new(Orientation::Horizontal, 10);
+                row.set_margin_top(12);
+                row.set_margin_bottom(12);
+                row.set_margin_start(12);
+                row.set_margin_end(12);
+
+                let check = CheckButton::new();
+                check.set_active(true);
+                check.set_size_request(22, 22);
+                check.set_valign(gtk::Align::Center);
+                check.add_css_class("discovery-select-check");
+
+                let text_col = GtkBox::new(Orientation::Vertical, 6);
+                text_col.set_hexpand(true);
+
+                let title = Label::new(Some(&item.title));
+                title.set_xalign(0.0);
+                title.set_wrap(false);
+                title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                title.add_css_class("heading");
+
+                let subtitle = Label::new(Some(&item.description));
+                subtitle.set_xalign(0.0);
+                subtitle.set_wrap(true);
+                subtitle.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+                subtitle.set_max_width_chars(56);
+                subtitle.add_css_class("dim-label");
+
+                let selected_mod_projects_toggle = selected_mod_projects_render.clone();
+                let render_mods_cards_toggle = render_mods_cards_holder_for_init.clone();
+                let project_id = item.project_id.clone();
+                check.connect_toggled(move |c| {
+                    if !c.is_active() {
+                        selected_mod_projects_toggle.borrow_mut().remove(&project_id);
+                        if let Some(render) = render_mods_cards_toggle.borrow().as_ref() {
+                            (render)();
+                        }
+                    }
+                });
+
+                text_col.append(&title);
+                text_col.append(&subtitle);
+                row.append(&check);
+                row.append(&text_col);
+                frame.set_child(Some(&row));
+
+                flow_mods_results_render.insert(&frame, -1);
+            }
+        }
+
+        let search_results_header = if selected_mod_projects_render.borrow().is_empty() {
+            "Search results"
+        } else {
+            "Search results (unchecked items)"
+        };
+        let header = Label::new(Some(search_results_header));
+        header.set_xalign(0.0);
+        header.add_css_class("dim-label");
+        flow_mods_results_render.insert(&header, -1);
+
+        let selected_ids: HashSet<String> = selected_mod_projects_render
+            .borrow()
+            .keys()
+            .cloned()
+            .collect();
+
+        for item in mods_results_render.borrow().iter() {
+            if selected_ids.contains(&item.project_id) {
+                continue;
+            }
+
             let frame = Frame::new(None);
             frame.set_hexpand(true);
             frame.set_valign(gtk::Align::Start);
@@ -1780,20 +2345,10 @@ fn build_ui(app: &Application) {
             row.set_margin_end(12);
 
             let check = CheckButton::new();
-            check.set_active(selected_mod_project_indices_render.borrow().contains(&idx));
-
-            let thumb = if let Some(path) = &item.icon_path {
-                let pic = Picture::for_filename(path);
-                pic.set_can_shrink(true);
-                pic.set_content_fit(gtk::ContentFit::Cover);
-                pic.set_size_request(48, 48);
-                pic.upcast::<gtk::Widget>()
-            } else {
-                let placeholder = Frame::new(None);
-                placeholder.set_size_request(48, 48);
-                ensure_discovery_card_css(&placeholder);
-                placeholder.upcast::<gtk::Widget>()
-            };
+            check.set_active(false);
+            check.set_size_request(22, 22);
+            check.set_valign(gtk::Align::Center);
+            check.add_css_class("discovery-select-check");
 
             let text_col = GtkBox::new(Orientation::Vertical, 6);
             text_col.set_hexpand(true);
@@ -1811,36 +2366,128 @@ fn build_ui(app: &Application) {
             subtitle.set_max_width_chars(56);
             subtitle.add_css_class("dim-label");
 
-            let selected_mod_project_indices_toggle = selected_mod_project_indices_render.clone();
+            let selected_mod_projects_toggle = selected_mod_projects_render.clone();
+            let render_mods_cards_toggle = render_mods_cards_holder_for_init.clone();
+            let item_for_toggle = item.clone();
             check.connect_toggled(move |c| {
-                let mut selected = selected_mod_project_indices_toggle.borrow_mut();
                 if c.is_active() {
-                    selected.insert(idx);
-                } else {
-                    selected.remove(&idx);
+                    selected_mod_projects_toggle
+                        .borrow_mut()
+                        .insert(item_for_toggle.project_id.clone(), item_for_toggle.clone());
+                    if let Some(render) = render_mods_cards_toggle.borrow().as_ref() {
+                        (render)();
+                    }
                 }
             });
 
             text_col.append(&title);
             text_col.append(&subtitle);
             row.append(&check);
-            row.append(&thumb);
             row.append(&text_col);
             frame.set_child(Some(&row));
 
             flow_mods_results_render.insert(&frame, -1);
         }
     });
+    *render_mods_cards_holder.borrow_mut() = Some(render_mods_cards.clone());
 
     let shaders_results_render = shaders_results.clone();
     let flow_shaders_results_render = flow_profile_shaders_results.clone();
-    let selected_shader_project_indices_render = selected_shader_project_indices.clone();
+    let selected_shader_projects_render = selected_shader_projects.clone();
+    let render_shaders_cards_holder: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+    let render_shaders_cards_holder_for_init = render_shaders_cards_holder.clone();
     let render_shaders_cards: Rc<dyn Fn()> = Rc::new(move || {
         while let Some(child) = flow_shaders_results_render.first_child() {
             flow_shaders_results_render.remove(&child);
         }
 
-        for (idx, item) in shaders_results_render.borrow().iter().enumerate() {
+        let mut selected_items: Vec<DiscoveryCardData> =
+            selected_shader_projects_render.borrow().values().cloned().collect();
+        selected_items.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+
+        if !selected_items.is_empty() {
+            let selected_header = Label::new(Some("Selected for install"));
+            selected_header.set_xalign(0.0);
+            selected_header.add_css_class("heading");
+            flow_shaders_results_render.insert(&selected_header, -1);
+
+            for item in selected_items {
+                let frame = Frame::new(None);
+                frame.set_hexpand(true);
+                frame.set_valign(gtk::Align::Start);
+                ensure_discovery_card_css(&frame);
+
+                let row = GtkBox::new(Orientation::Horizontal, 10);
+                row.set_margin_top(12);
+                row.set_margin_bottom(12);
+                row.set_margin_start(12);
+                row.set_margin_end(12);
+
+                let check = CheckButton::new();
+                check.set_active(true);
+                check.set_size_request(22, 22);
+                check.set_valign(gtk::Align::Center);
+                check.add_css_class("discovery-select-check");
+
+                let text_col = GtkBox::new(Orientation::Vertical, 6);
+                text_col.set_hexpand(true);
+
+                let title = Label::new(Some(&item.title));
+                title.set_xalign(0.0);
+                title.set_wrap(false);
+                title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                title.add_css_class("heading");
+
+                let subtitle = Label::new(Some(&item.description));
+                subtitle.set_xalign(0.0);
+                subtitle.set_wrap(true);
+                subtitle.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+                subtitle.set_max_width_chars(56);
+                subtitle.add_css_class("dim-label");
+
+                let selected_shader_projects_toggle = selected_shader_projects_render.clone();
+                let render_shaders_cards_toggle = render_shaders_cards_holder_for_init.clone();
+                let project_id = item.project_id.clone();
+                check.connect_toggled(move |c| {
+                    if !c.is_active() {
+                        selected_shader_projects_toggle.borrow_mut().remove(&project_id);
+                        if let Some(render) = render_shaders_cards_toggle.borrow().as_ref() {
+                            (render)();
+                        }
+                    }
+                });
+
+                text_col.append(&title);
+                text_col.append(&subtitle);
+                row.append(&check);
+                row.append(&text_col);
+                frame.set_child(Some(&row));
+
+                flow_shaders_results_render.insert(&frame, -1);
+            }
+        }
+
+        let search_results_header = if selected_shader_projects_render.borrow().is_empty() {
+            "Search results"
+        } else {
+            "Search results (unchecked items)"
+        };
+        let header = Label::new(Some(search_results_header));
+        header.set_xalign(0.0);
+        header.add_css_class("dim-label");
+        flow_shaders_results_render.insert(&header, -1);
+
+        let selected_ids: HashSet<String> = selected_shader_projects_render
+            .borrow()
+            .keys()
+            .cloned()
+            .collect();
+
+        for item in shaders_results_render.borrow().iter() {
+            if selected_ids.contains(&item.project_id) {
+                continue;
+            }
+
             let frame = Frame::new(None);
             frame.set_hexpand(true);
             frame.set_valign(gtk::Align::Start);
@@ -1853,24 +2500,10 @@ fn build_ui(app: &Application) {
             row.set_margin_end(12);
 
             let check = CheckButton::new();
-            check.set_active(
-                selected_shader_project_indices_render
-                    .borrow()
-                    .contains(&idx),
-            );
-
-            let thumb = if let Some(path) = &item.icon_path {
-                let pic = Picture::for_filename(path);
-                pic.set_can_shrink(true);
-                pic.set_content_fit(gtk::ContentFit::Cover);
-                pic.set_size_request(48, 48);
-                pic.upcast::<gtk::Widget>()
-            } else {
-                let placeholder = Frame::new(None);
-                placeholder.set_size_request(48, 48);
-                ensure_discovery_card_css(&placeholder);
-                placeholder.upcast::<gtk::Widget>()
-            };
+            check.set_active(false);
+            check.set_size_request(22, 22);
+            check.set_valign(gtk::Align::Center);
+            check.add_css_class("discovery-select-check");
 
             let text_col = GtkBox::new(Orientation::Vertical, 6);
             text_col.set_hexpand(true);
@@ -1888,27 +2521,30 @@ fn build_ui(app: &Application) {
             subtitle.set_max_width_chars(56);
             subtitle.add_css_class("dim-label");
 
-            let selected_shader_project_indices_toggle =
-                selected_shader_project_indices_render.clone();
+            let selected_shader_projects_toggle = selected_shader_projects_render.clone();
+            let render_shaders_cards_toggle = render_shaders_cards_holder_for_init.clone();
+            let item_for_toggle = item.clone();
             check.connect_toggled(move |c| {
-                let mut selected = selected_shader_project_indices_toggle.borrow_mut();
                 if c.is_active() {
-                    selected.insert(idx);
-                } else {
-                    selected.remove(&idx);
+                    selected_shader_projects_toggle
+                        .borrow_mut()
+                        .insert(item_for_toggle.project_id.clone(), item_for_toggle.clone());
+                    if let Some(render) = render_shaders_cards_toggle.borrow().as_ref() {
+                        (render)();
+                    }
                 }
             });
 
             text_col.append(&title);
             text_col.append(&subtitle);
             row.append(&check);
-            row.append(&thumb);
             row.append(&text_col);
             frame.set_child(Some(&row));
 
             flow_shaders_results_render.insert(&frame, -1);
         }
     });
+    *render_shaders_cards_holder.borrow_mut() = Some(render_shaders_cards.clone());
 
     let mods_installed_render = mods_installed.clone();
     let flow_mods_installed_render = flow_profile_mods_installed.clone();
@@ -2264,6 +2900,10 @@ fn build_ui(app: &Application) {
     let row_profile_name_refresh = row_profile_name.clone();
     let row_loader_version_exact_refresh = row_profile_loader_version_exact.clone();
     let row_profile_color_hex_refresh = row_profile_color_hex.clone();
+    let dropdown_profile_runtime_java_policy_refresh = dropdown_profile_runtime_java_policy.clone();
+    let row_java_binary_refresh = row_java_binary.clone();
+    let row_profile_runtime_memory_mb_refresh = row_profile_runtime_memory_mb.clone();
+    let row_profile_runtime_jvm_args_refresh = row_profile_runtime_jvm_args.clone();
     let btn_profile_create_refresh = btn_profile_create.clone();
     let btn_profile_save_refresh = btn_profile_save.clone();
     let btn_profile_delete_refresh = btn_profile_delete.clone();
@@ -2299,6 +2939,14 @@ fn build_ui(app: &Application) {
                 row_loader_version_exact_refresh.set_text("");
                 row_profile_color_hex_refresh.set_sensitive(false);
                 row_profile_color_hex_refresh.set_text("");
+                dropdown_profile_runtime_java_policy_refresh.set_sensitive(false);
+                dropdown_profile_runtime_java_policy_refresh.set_selected(0);
+                row_java_binary_refresh.set_sensitive(false);
+                row_java_binary_refresh.set_text("");
+                row_profile_runtime_memory_mb_refresh.set_sensitive(false);
+                row_profile_runtime_memory_mb_refresh.set_text("");
+                row_profile_runtime_jvm_args_refresh.set_sensitive(false);
+                row_profile_runtime_jvm_args_refresh.set_text("");
 
                 btn_profile_create_refresh.set_sensitive(!version_list.is_empty());
                 btn_profile_save_refresh.set_sensitive(false);
@@ -2373,6 +3021,23 @@ fn build_ui(app: &Application) {
                         row_loader_version_exact_refresh.set_text("");
                     }
                 }
+
+                dropdown_profile_runtime_java_policy_refresh.set_sensitive(true);
+                dropdown_profile_runtime_java_policy_refresh
+                    .set_selected(if selected_profile.java_auto_download { 0 } else { 1 });
+                row_java_binary_refresh.set_sensitive(true);
+                row_java_binary_refresh
+                    .set_text(selected_profile.java_binary.as_deref().unwrap_or(""));
+                row_profile_runtime_memory_mb_refresh.set_sensitive(true);
+                row_profile_runtime_memory_mb_refresh.set_text(
+                    &selected_profile
+                        .java_memory_mb
+                        .map(|v| v.to_string())
+                        .unwrap_or_default(),
+                );
+                row_profile_runtime_jvm_args_refresh.set_sensitive(true);
+                row_profile_runtime_jvm_args_refresh
+                    .set_text(selected_profile.java_args.as_deref().unwrap_or(""));
             }
 
             btn_profile_manage_mods_refresh.set_sensitive(true);
@@ -2472,6 +3137,10 @@ fn build_ui(app: &Application) {
     let dropdown_profile_loader_sync = dropdown_profile_loader.clone();
     let dropdown_profile_loader_version_mode_sync = dropdown_profile_loader_version_mode.clone();
     let row_profile_loader_version_exact_sync = row_profile_loader_version_exact.clone();
+    let dropdown_profile_runtime_java_policy_sync = dropdown_profile_runtime_java_policy.clone();
+    let row_java_binary_sync = row_java_binary.clone();
+    let row_profile_runtime_memory_mb_sync = row_profile_runtime_memory_mb.clone();
+    let row_profile_runtime_jvm_args_sync = row_profile_runtime_jvm_args.clone();
     let dropdown_profile_launch_sync = dropdown_profile_launch.clone();
     let refresh_mods_installed_on_profile_change =
         refresh_mods_installed_for_selected_profile.clone();
@@ -2504,6 +3173,16 @@ fn build_ui(app: &Application) {
                     row_profile_loader_version_exact_sync.set_text("");
                 }
             }
+            dropdown_profile_runtime_java_policy_sync
+                .set_selected(if profile.java_auto_download { 0 } else { 1 });
+            row_java_binary_sync.set_text(profile.java_binary.as_deref().unwrap_or(""));
+            row_profile_runtime_memory_mb_sync.set_text(
+                &profile
+                    .java_memory_mb
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
+            );
+            row_profile_runtime_jvm_args_sync.set_text(profile.java_args.as_deref().unwrap_or(""));
         }
         (refresh_mods_installed_on_profile_change)();
         (refresh_shaders_installed_on_profile_change)();
@@ -2553,6 +3232,10 @@ fn build_ui(app: &Application) {
     let dropdown_profile_color_mode_create = dropdown_profile_color_mode.clone();
     let row_profile_loader_version_exact_create = row_profile_loader_version_exact.clone();
     let row_profile_color_hex_create = row_profile_color_hex.clone();
+    let dropdown_profile_runtime_java_policy_create = dropdown_profile_runtime_java_policy.clone();
+    let row_java_binary_create = row_java_binary.clone();
+    let row_profile_runtime_memory_mb_create = row_profile_runtime_memory_mb.clone();
+    let row_profile_runtime_jvm_args_create = row_profile_runtime_jvm_args.clone();
     let refresh_after_create = refresh_profile_models.clone();
     let refresh_mods_after_create = refresh_mods_installed_for_selected_profile.clone();
     let refresh_shaders_after_create = refresh_shaders_installed_for_selected_profile.clone();
@@ -2625,6 +3308,15 @@ fn build_ui(app: &Application) {
             None
         };
 
+        let java_memory_mb = match parse_optional_u32(&row_profile_runtime_memory_mb_create.text()) {
+            Some(v) => Some(v),
+            None if row_profile_runtime_memory_mb_create.text().trim().is_empty() => None,
+            None => {
+                lbl_status_create.set_label("Memory limit must be an integer MB value");
+                return;
+            }
+        };
+
         profiles_create.borrow_mut().push(LauncherProfile {
             name: name.clone(),
             version_id,
@@ -2632,6 +3324,10 @@ fn build_ui(app: &Application) {
             loader_version,
             color_mode,
             color_hex,
+            java_binary: normalize_optional_text(&row_java_binary_create.text()),
+            java_auto_download: dropdown_profile_runtime_java_policy_create.selected() == 0,
+            java_memory_mb,
+            java_args: normalize_optional_text(&row_profile_runtime_jvm_args_create.text()),
         });
 
         if let Err(e) = save_profiles_to_disk(&profiles_create.borrow()) {
@@ -2655,6 +3351,10 @@ fn build_ui(app: &Application) {
     let dropdown_profile_loader_version_mode_save = dropdown_profile_loader_version_mode.clone();
     let dropdown_profile_color_mode_save = dropdown_profile_color_mode.clone();
     let row_profile_color_hex_save = row_profile_color_hex.clone();
+    let dropdown_profile_runtime_java_policy_save = dropdown_profile_runtime_java_policy.clone();
+    let row_java_binary_save = row_java_binary.clone();
+    let row_profile_runtime_memory_mb_save = row_profile_runtime_memory_mb.clone();
+    let row_profile_runtime_jvm_args_save = row_profile_runtime_jvm_args.clone();
     let refresh_after_save = refresh_profile_models.clone();
     let refresh_mods_after_save = refresh_mods_installed_for_selected_profile.clone();
     let refresh_shaders_after_save = refresh_shaders_installed_for_selected_profile.clone();
@@ -2730,6 +3430,15 @@ fn build_ui(app: &Application) {
             None
         };
 
+        let java_memory_mb = match parse_optional_u32(&row_profile_runtime_memory_mb_save.text()) {
+            Some(v) => Some(v),
+            None if row_profile_runtime_memory_mb_save.text().trim().is_empty() => None,
+            None => {
+                lbl_status_save.set_label("Memory limit must be an integer MB value");
+                return;
+            }
+        };
+
         if let Some(profile) = profiles_save.borrow_mut().get_mut(idx) {
             profile.name = new_name.clone();
             profile.version_id = version_id;
@@ -2737,6 +3446,10 @@ fn build_ui(app: &Application) {
             profile.loader_version = loader_version;
             profile.color_mode = color_mode;
             profile.color_hex = color_hex;
+            profile.java_binary = normalize_optional_text(&row_java_binary_save.text());
+            profile.java_auto_download = dropdown_profile_runtime_java_policy_save.selected() == 0;
+            profile.java_memory_mb = java_memory_mb;
+            profile.java_args = normalize_optional_text(&row_profile_runtime_jvm_args_save.text());
         }
 
         if let Err(e) = save_profiles_to_disk(&profiles_save.borrow()) {
@@ -2889,13 +3602,13 @@ fn build_ui(app: &Application) {
     // Mods/Shaders in profile editor bottom sheets.
     let sheet_profile_mods_open = sheet_profile_mods.clone();
     let mods_results_clear_on_open = mods_results.clone();
-    let selected_mod_project_indices_open = selected_mod_project_indices.clone();
+    let selected_mod_projects_open = selected_mod_projects.clone();
     let lbl_profile_mods_results_status_open = lbl_profile_mods_results_status.clone();
     let render_mods_cards_open = render_mods_cards.clone();
     let refresh_mods_installed_on_open = refresh_mods_installed_for_selected_profile.clone();
     btn_profile_manage_mods.connect_clicked(move |_| {
         mods_results_clear_on_open.borrow_mut().clear();
-        selected_mod_project_indices_open.borrow_mut().clear();
+        selected_mod_projects_open.borrow_mut().clear();
         lbl_profile_mods_results_status_open.set_label("Search mods for this profile");
         (render_mods_cards_open)();
         (refresh_mods_installed_on_open)();
@@ -2904,13 +3617,13 @@ fn build_ui(app: &Application) {
 
     let sheet_profile_shaders_open = sheet_profile_shaders.clone();
     let shaders_results_clear_on_open = shaders_results.clone();
-    let selected_shader_project_indices_open = selected_shader_project_indices.clone();
+    let selected_shader_projects_open = selected_shader_projects.clone();
     let lbl_profile_shaders_results_status_open = lbl_profile_shaders_results_status.clone();
     let render_shaders_cards_open = render_shaders_cards.clone();
     let refresh_shaders_installed_on_open = refresh_shaders_installed_for_selected_profile.clone();
     btn_profile_manage_shaders.connect_clicked(move |_| {
         shaders_results_clear_on_open.borrow_mut().clear();
-        selected_shader_project_indices_open.borrow_mut().clear();
+        selected_shader_projects_open.borrow_mut().clear();
         lbl_profile_shaders_results_status_open.set_label("Search shaderpacks for this profile");
         (render_shaders_cards_open)();
         (refresh_shaders_installed_on_open)();
@@ -2920,16 +3633,38 @@ fn build_ui(app: &Application) {
     let tx_mods_search = tx.clone();
     let entry_mods_search_click = entry_profile_mods_search.clone();
     let lbl_mods_results_status_click = lbl_profile_mods_results_status.clone();
+    let profiles_mods_search = profiles.clone();
+    let profile_editor_mods_search = dropdown_profile_editor.clone();
+    let mods_results_for_vanilla_clear = mods_results.clone();
+    let selected_mods_for_vanilla_clear = selected_mod_projects.clone();
+    let render_mods_cards_for_vanilla_clear = render_mods_cards.clone();
     btn_profile_mods_search.connect_clicked(move |_| {
         let query = entry_mods_search_click.text().trim().to_string();
         if query.is_empty() {
             lbl_mods_results_status_click.set_label("Enter a search query first");
             return;
         }
+
+        let profile_idx = profile_editor_mods_search.selected() as usize;
+        let Some(profile) = profiles_mods_search.borrow().get(profile_idx).cloned() else {
+            lbl_mods_results_status_click.set_label("Select a valid profile first");
+            return;
+        };
+
+        if profile.loader == ProfileLoader::Vanilla {
+            mods_results_for_vanilla_clear.borrow_mut().clear();
+            selected_mods_for_vanilla_clear.borrow_mut().clear();
+            (render_mods_cards_for_vanilla_clear)();
+            lbl_mods_results_status_click.set_label(
+                "Selected profile uses Vanilla loader: mods are incompatible",
+            );
+            return;
+        }
+
         lbl_mods_results_status_click.set_label("Searching Modrinth…");
         let tx = tx_mods_search.clone();
         thread::spawn(
-            move || match fetch_modrinth_projects(DiscoveryKind::Mods, &query) {
+            move || match fetch_modrinth_projects(DiscoveryKind::Mods, &query, Some(&profile)) {
                 Ok(results) => {
                     let _ = tx.send(LauncherMessage::DiscoverySearchResults {
                         kind: DiscoveryKind::Mods,
@@ -2965,30 +3700,21 @@ fn build_ui(app: &Application) {
     let profiles_mods_install = profiles.clone();
     let profile_editor_for_mods_install = dropdown_profile_editor.clone();
     let launch_dropdown_for_mods_install = dropdown_profile_launch.clone();
-    let mods_results_install = mods_results.clone();
-    let selected_mod_project_indices_install = selected_mod_project_indices.clone();
+    let selected_mod_projects_install = selected_mod_projects.clone();
     let tx_mods_install = tx.clone();
     let sheet_profile_mods_install = sheet_profile_mods.clone();
     btn_profile_mods_sheet_install.connect_clicked(move |_| {
-        let selected_indices: Vec<usize> = selected_mod_project_indices_install
+        let selected_projects: Vec<DiscoveryCardData> = selected_mod_projects_install
             .borrow()
-            .iter()
-            .copied()
+            .values()
+            .cloned()
             .collect();
-        if selected_indices.is_empty() {
+        if selected_projects.is_empty() {
             let _ = tx_mods_install.send(LauncherMessage::TaskFailed(
                 "Select one or more mods to install".to_string(),
             ));
             return;
         }
-
-        let selected_projects: Vec<DiscoveryCardData> = {
-            let all = mods_results_install.borrow();
-            selected_indices
-                .into_iter()
-                .filter_map(|idx| all.get(idx).cloned())
-                .collect()
-        };
 
         let profile_idx = profile_editor_for_mods_install.selected() as usize;
         launch_dropdown_for_mods_install.set_selected(profile_idx as u32);
@@ -3044,7 +3770,7 @@ fn build_ui(app: &Application) {
         lbl_shaders_results_status_click.set_label("Searching Modrinth…");
         let tx = tx_shaders_search.clone();
         thread::spawn(
-            move || match fetch_modrinth_projects(DiscoveryKind::Shaders, &query) {
+            move || match fetch_modrinth_projects(DiscoveryKind::Shaders, &query, None) {
                 Ok(results) => {
                     let _ = tx.send(LauncherMessage::DiscoverySearchResults {
                         kind: DiscoveryKind::Shaders,
@@ -3080,30 +3806,21 @@ fn build_ui(app: &Application) {
     let profiles_shaders_install = profiles.clone();
     let profile_editor_for_shaders_install = dropdown_profile_editor.clone();
     let launch_dropdown_for_shaders_install = dropdown_profile_launch.clone();
-    let shaders_results_install = shaders_results.clone();
-    let selected_shader_project_indices_install = selected_shader_project_indices.clone();
+    let selected_shader_projects_install = selected_shader_projects.clone();
     let tx_shaders_install = tx.clone();
     let sheet_profile_shaders_install = sheet_profile_shaders.clone();
     btn_profile_shaders_sheet_install.connect_clicked(move |_| {
-        let selected_indices: Vec<usize> = selected_shader_project_indices_install
+        let selected_projects: Vec<DiscoveryCardData> = selected_shader_projects_install
             .borrow()
-            .iter()
-            .copied()
+            .values()
+            .cloned()
             .collect();
-        if selected_indices.is_empty() {
+        if selected_projects.is_empty() {
             let _ = tx_shaders_install.send(LauncherMessage::TaskFailed(
                 "Select one or more shaderpacks to install".to_string(),
             ));
             return;
         }
-
-        let selected_projects: Vec<DiscoveryCardData> = {
-            let all = shaders_results_install.borrow();
-            selected_indices
-                .into_iter()
-                .filter_map(|idx| all.get(idx).cloned())
-                .collect()
-        };
 
         let profile_idx = profile_editor_for_shaders_install.selected() as usize;
         launch_dropdown_for_shaders_install.set_selected(profile_idx as u32);
@@ -3168,8 +3885,6 @@ fn build_ui(app: &Application) {
     let render_home_cards_poll = render_home_cards.clone();
     let mods_results_poll = mods_results.clone();
     let shaders_results_poll = shaders_results.clone();
-    let selected_mod_project_indices_poll = selected_mod_project_indices.clone();
-    let selected_shader_project_indices_poll = selected_shader_project_indices.clone();
     let lbl_mods_results_status_poll = lbl_profile_mods_results_status.clone();
     let lbl_shaders_results_status_poll = lbl_profile_shaders_results_status.clone();
     let render_mods_cards_poll = render_mods_cards.clone();
@@ -3279,14 +3994,12 @@ fn build_ui(app: &Application) {
                     match kind {
                         DiscoveryKind::Mods => {
                             *mods_results_poll.borrow_mut() = results;
-                            selected_mod_project_indices_poll.borrow_mut().clear();
                             lbl_mods_results_status_poll
                                 .set_label(&format!("{} result(s) for '{}'", count, query));
                             (render_mods_cards_poll)();
                         }
                         DiscoveryKind::Shaders => {
                             *shaders_results_poll.borrow_mut() = results;
-                            selected_shader_project_indices_poll.borrow_mut().clear();
                             lbl_shaders_results_status_poll
                                 .set_label(&format!("{} result(s) for '{}'", count, query));
                             (render_shaders_cards_poll)();
@@ -3370,7 +4083,6 @@ fn build_ui(app: &Application) {
 
     // --- 4. Play Engine Activation ---
     let launch_profile_dropdown = dropdown_profile_launch.clone();
-    let row_java_clone = row_java_binary.clone();
     let current_session_launch = current_session.clone();
     let profiles_launch = profiles.clone();
 
@@ -3421,7 +4133,17 @@ fn build_ui(app: &Application) {
             return;
         }
 
-        let java_path_raw = row_java_clone.text().to_string();
+        let java_path_raw = selected_profile
+            .java_binary
+            .as_deref()
+            .unwrap_or("")
+            .to_string();
+
+        let java_install_policy = if selected_profile.java_auto_download {
+            mc_launcher_core::install::JavaInstallPolicy::Auto
+        } else {
+            mc_launcher_core::install::JavaInstallPolicy::Never
+        };
 
         let thread_tx = tx.clone();
 
@@ -3482,7 +4204,15 @@ fn build_ui(app: &Application) {
                 )))
                 .unwrap();
 
-            let mc_dir = std::env::current_dir().unwrap().join(".minecraft");
+            let mc_dir = match minecraft_root_dir() {
+                Ok(path) => path,
+                Err(e) => {
+                    let _ = thread_tx.send(LauncherMessage::TaskFailed(format!(
+                        "Failed resolving runtime minecraft directory: {e}"
+                    )));
+                    return;
+                }
+            };
             let launcher = Launcher::new(mc_dir);
 
             thread_tx
@@ -3568,7 +4298,7 @@ fn build_ui(app: &Application) {
                 let install_req = InstallRequest {
                     minecraft_version: selected_profile.version_id.clone(),
                     loader: loader_spec,
-                    java: JavaInstallPolicy::Auto,
+                    java: java_install_policy,
                 };
 
                 match launcher.install(install_req) {
@@ -3624,6 +4354,34 @@ fn build_ui(app: &Application) {
 
                             match profile_game_directory(&selected_profile) {
                                 Ok(game_dir) => {
+                                    let _ = thread_tx.send(LauncherMessage::StatusUpdate(
+                                        "Repairing mods".to_string(),
+                                    ));
+
+                                    match auto_repair_profile_mods(&selected_profile, &thread_tx) {
+                                        Ok(summary) => {
+                                            let _ = thread_tx.send(LauncherMessage::Log(format!(
+                                                "Auto-repair summary: checked={}, updated={}, disabled={}, unknown={}",
+                                                summary.checked, summary.updated, summary.disabled, summary.unknown
+                                            )));
+
+                                            if !summary.disabled_mods.is_empty() {
+                                                let _ = thread_tx.send(LauncherMessage::TaskFailed(format!(
+                                                    "Mod repair disabled incompatible mods with no compatible replacements for profile '{}': {}",
+                                                    selected_profile.name,
+                                                    summary.disabled_mods.join(", ")
+                                                )));
+                                                return;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            let _ = thread_tx.send(LauncherMessage::TaskFailed(format!(
+                                                "Failed during mod compatibility auto-repair: {e}"
+                                            )));
+                                            return;
+                                        }
+                                    }
+
                                     let mods_dir = game_dir.join("mods");
                                     let shaders_dir = game_dir.join("shaderpacks");
 
@@ -3670,6 +4428,18 @@ fn build_ui(app: &Application) {
 
                             match launcher.build_launch_command_from_version(&version_meta, options) {
                                 Ok(mut launch_cmd) => {
+                                    let injected = apply_profile_runtime_jvm_overrides(
+                                        &mut launch_cmd.args,
+                                        version_meta.main_class.as_deref(),
+                                        selected_profile.java_memory_mb,
+                                        selected_profile.java_args.as_deref(),
+                                    );
+                                    if injected > 0 {
+                                        let _ = thread_tx.send(LauncherMessage::Log(format!(
+                                            "Applied {injected} profile JVM override argument(s)"
+                                        )));
+                                    }
+
                                     let removed = dedupe_launch_classpath(&mut launch_cmd.args);
                                     if removed > 0 {
                                         let _ = thread_tx.send(LauncherMessage::Log(format!(
