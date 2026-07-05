@@ -1423,7 +1423,115 @@ fn discover_java_from_env() -> Option<PathBuf> {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        let mut roots = vec![
+            PathBuf::from(r"C:\Program Files\Java"),
+            PathBuf::from(r"C:\Program Files (x86)\Java"),
+        ];
+
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            roots.push(PathBuf::from(local_app_data).join("Programs").join("Eclipse Adoptium"));
+        }
+
+        for root in roots {
+            if let Ok(entries) = fs::read_dir(&root) {
+                for entry in entries.flatten() {
+                    let candidate_home = entry.path();
+                    if !candidate_home.is_dir() {
+                        continue;
+                    }
+
+                    for bin in java_binary_names() {
+                        let candidate = candidate_home.join("bin").join(bin);
+                        if candidate.is_file() {
+                            return Some(candidate);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let roots = ["/usr/lib/jvm", "/usr/lib/sdk", "/usr/java", "/opt/java"];
+
+        for root in roots {
+            let root = Path::new(root);
+            if let Ok(entries) = fs::read_dir(root) {
+                for entry in entries.flatten() {
+                    let candidate_home = entry.path();
+                    if !candidate_home.is_dir() {
+                        continue;
+                    }
+
+                    for bin in java_binary_names() {
+                        let candidate = candidate_home.join("bin").join(bin);
+                        if candidate.is_file() {
+                            return Some(candidate);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     None
+}
+
+fn ensure_runtime_java_for_version(
+    minecraft_dir: &Path,
+    version_id: &str,
+    version_meta: Option<&mc_launcher_core::core::version::VersionJson>,
+    tx: &mpsc::Sender<LauncherMessage>,
+) -> Result<Option<PathBuf>, String> {
+    let runtime_component = version_meta
+        .and_then(|meta| meta.java_version.as_ref().map(|j| j.component.clone()))
+        .or_else(|| {
+            mc_launcher_core::runtime::get_version_runtime_information(version_id, minecraft_dir)
+                .map(|info| info.name)
+        });
+
+    let Some(runtime_component) = runtime_component else {
+        return Ok(None);
+    };
+
+    if let Some(executable) =
+        mc_launcher_core::runtime::get_executable_path(&runtime_component, minecraft_dir)
+    {
+        let _ = tx.send(LauncherMessage::Log(format!(
+            "Using managed Java runtime '{}' from {}",
+            runtime_component,
+            executable.display()
+        )));
+        return Ok(Some(executable));
+    }
+
+    let _ = tx.send(LauncherMessage::Log(format!(
+        "No managed Java runtime found for '{}'; downloading runtime component '{}'...",
+        version_id, runtime_component
+    )));
+
+    let callback = mc_launcher_core::types::CallbackDict::default();
+    mc_launcher_core::runtime::install_jvm_runtime(&runtime_component, minecraft_dir, &callback)
+        .map_err(|e| format!("failed auto-installing Java runtime '{runtime_component}': {e}"))?;
+
+    if let Some(executable) =
+        mc_launcher_core::runtime::get_executable_path(&runtime_component, minecraft_dir)
+    {
+        let _ = tx.send(LauncherMessage::Log(format!(
+            "Installed managed Java runtime '{}' at {}",
+            runtime_component,
+            executable.display()
+        )));
+        return Ok(Some(executable));
+    }
+
+    Err(format!(
+        "Java runtime '{}' was downloaded but no executable could be resolved",
+        runtime_component
+    ))
 }
 
 fn resolve_preferred_java_executable(java_path_raw: &str) -> Result<Option<PathBuf>, String> {
@@ -1487,6 +1595,7 @@ fn install_forge_profile_with_java(
     minecraft_version: &str,
     forge_version: &str,
     java_path_raw: &str,
+    java_auto_download: bool,
     tx: &mpsc::Sender<LauncherMessage>,
 ) -> Result<String, String> {
     use mc_launcher_core::install::InstallRequest;
@@ -1540,10 +1649,27 @@ fn install_forge_profile_with_java(
         })?;
     }
 
-    let java_executable = if !java_path_raw.is_empty() && java_path_raw != "/path/to/binary" {
-        PathBuf::from(java_path_raw)
-    } else {
-        PathBuf::from("java")
+    let java_executable = match resolve_preferred_java_executable(java_path_raw) {
+        Ok(Some(path)) => path,
+        Ok(None) => {
+            if java_auto_download {
+                match ensure_runtime_java_for_version(launcher.minecraft_dir(), minecraft_version, None, tx) {
+                    Ok(Some(path)) => path,
+                    Ok(None) => {
+                        return Err(
+                            "No Java runtime could be resolved for Forge installation".to_string(),
+                        )
+                    }
+                    Err(e) => return Err(e),
+                }
+            } else {
+                return Err(
+                    "No Java runtime available for Forge installation and Auto download is disabled"
+                        .to_string(),
+                );
+            }
+        }
+        Err(e) => return Err(e),
     };
 
     let _ = tx.send(LauncherMessage::Log(format!(
@@ -4379,6 +4505,7 @@ fn build_ui(app: &Application) {
                     &selected_profile.version_id,
                     &forge_version,
                     &forge_java_path,
+                    selected_profile.java_auto_download,
                     &thread_tx,
                 );
                 install_progress.store(false, Ordering::Relaxed);
@@ -4573,7 +4700,35 @@ fn build_ui(app: &Application) {
                                 }
                             }
 
-                            if let Some(java) = &preferred_java {
+                            let mut launch_java = preferred_java.clone();
+                            if launch_java.is_none() && selected_profile.java_auto_download {
+                                match ensure_runtime_java_for_version(
+                                    launcher.minecraft_dir(),
+                                    &installed_version_id,
+                                    Some(&version_meta),
+                                    &thread_tx,
+                                ) {
+                                    Ok(Some(path)) => launch_java = Some(path),
+                                    Ok(None) => {
+                                        let _ = thread_tx.send(LauncherMessage::Log(
+                                            "No version-specific managed Java runtime metadata found; falling back to system discovery".to_string(),
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        let _ = thread_tx.send(LauncherMessage::TaskFailed(format!(
+                                            "Java runtime auto-install failed: {}",
+                                            e
+                                        )));
+                                        return;
+                                    }
+                                }
+                            }
+
+                            if launch_java.is_none() {
+                                launch_java = discover_java_from_env();
+                            }
+
+                            if let Some(java) = &launch_java {
                                 options.java_executable = Some(java.clone());
                             }
 
@@ -4626,7 +4781,7 @@ fn build_ui(app: &Application) {
                                     let mut child_res = spawn_with(&launch_cmd.executable);
                                     if let Err(err) = &child_res {
                                         if err.kind() == io::ErrorKind::NotFound {
-                                            if let Some(java) = &preferred_java {
+                                            if let Some(java) = &launch_java {
                                                 if java != &launch_cmd.executable {
                                                     let _ = thread_tx.send(LauncherMessage::Log(format!(
                                                         "Launch executable not found; retrying with resolved Java: {}",
@@ -4714,7 +4869,7 @@ fn build_ui(app: &Application) {
                                         }
                                         Err(e) => {
                                             let _ = thread_tx.send(LauncherMessage::TaskFailed(format!(
-                                                "Failed to spawn Java execution process: {}. Configure a valid Java binary in Profile Editor > Runtime Settings (or set JAVA_HOME).",
+                                                "Failed to spawn Java execution process: {}. Configure a valid Java binary in Profile Editor > Runtime Settings, or keep Runtime Java policy on Auto to download a managed runtime.",
                                                 e
                                             )));
                                         }
