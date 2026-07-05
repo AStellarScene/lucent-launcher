@@ -34,6 +34,7 @@ const PROFILES_FILE_NAME: &str = "profiles.json";
 const UI_RESOURCE_PATH: &str = "/com/lucentlauncher/ui/launcher.ui";
 const DATA_DIR_ENV: &str = "LUCENT_DATA_DIR";
 const APP_DATA_SUBDIR: &str = "lucent-launcher";
+const JVM_MANIFEST_URL: &str = "https://launchermeta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json";
 
 #[derive(Clone)]
 enum Session {
@@ -288,6 +289,41 @@ struct ModRepairSummary {
     disabled: usize,
     unknown: usize,
     disabled_mods: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RuntimeManifestRef {
+    url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RuntimeVersionRef {
+    manifest: RuntimeManifestRef,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RuntimeDownloadEntry {
+    url: String,
+    sha1: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RuntimeDownloads {
+    raw: RuntimeDownloadEntry,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RuntimeFileEntry {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    #[allow(dead_code)]
+    executable: Option<bool>,
+    downloads: Option<RuntimeDownloads>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PlatformManifest {
+    files: HashMap<String, RuntimeFileEntry>,
 }
 
 // Messages sent from worker threads back to UI thread.
@@ -1514,8 +1550,16 @@ fn ensure_runtime_java_for_version(
     )));
 
     let callback = mc_launcher_core::types::CallbackDict::default();
-    mc_launcher_core::runtime::install_jvm_runtime(&runtime_component, minecraft_dir, &callback)
-        .map_err(|e| format!("failed auto-installing Java runtime '{runtime_component}': {e}"))?;
+    if let Err(primary_err) =
+        mc_launcher_core::runtime::install_jvm_runtime(&runtime_component, minecraft_dir, &callback)
+    {
+        let _ = tx.send(LauncherMessage::Log(format!(
+            "Primary Java runtime install failed for '{}': {}. Retrying with raw-file runtime installer...",
+            runtime_component, primary_err
+        )));
+
+        install_jvm_runtime_raw_files(&runtime_component, minecraft_dir)?;
+    }
 
     if let Some(executable) =
         mc_launcher_core::runtime::get_executable_path(&runtime_component, minecraft_dir)
@@ -1532,6 +1576,159 @@ fn ensure_runtime_java_for_version(
         "Java runtime '{}' was downloaded but no executable could be resolved",
         runtime_component
     ))
+}
+
+fn runtime_platform_key() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", "x86") => "windows-x86",
+        ("windows", "aarch64") => "windows-arm64",
+        ("windows", _) => "windows-x64",
+        ("linux", "x86") => "linux-i386",
+        ("linux", _) => "linux",
+        ("macos", "aarch64") => "mac-os-arm64",
+        ("macos", _) => "mac-os",
+        _ => "gamecore",
+    }
+}
+
+fn runtime_safe_join(base: &Path, rel: &str) -> Result<PathBuf, String> {
+    let mut out = base.to_path_buf();
+    for component in Path::new(rel).components() {
+        match component {
+            std::path::Component::Normal(part) => out.push(part),
+            std::path::Component::CurDir => {}
+            _ => {
+                return Err(format!(
+                    "unsafe runtime manifest path rejected: {}",
+                    rel
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn install_jvm_runtime_raw_files(jvm_component: &str, minecraft_dir: &Path) -> Result<(), String> {
+    let platform = runtime_platform_key();
+    let client = Client::new();
+
+    let runtime_index: HashMap<String, HashMap<String, Vec<RuntimeVersionRef>>> = client
+        .get(JVM_MANIFEST_URL)
+        .send()
+        .map_err(|e| format!("failed requesting JVM runtime index: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("failed fetching JVM runtime index: {e}"))?
+        .json()
+        .map_err(|e| format!("failed parsing JVM runtime index: {e}"))?;
+
+    let runtime_versions = runtime_index
+        .get(platform)
+        .and_then(|entries| entries.get(jvm_component))
+        .ok_or_else(|| {
+            format!(
+                "runtime component '{}' is not available for platform '{}'",
+                jvm_component, platform
+            )
+        })?;
+
+    let runtime_manifest_url = runtime_versions
+        .first()
+        .map(|entry| entry.manifest.url.clone())
+        .ok_or_else(|| {
+            format!(
+                "runtime component '{}' has no manifest entries for platform '{}'",
+                jvm_component, platform
+            )
+        })?;
+
+    let platform_manifest: PlatformManifest = client
+        .get(runtime_manifest_url)
+        .send()
+        .map_err(|e| format!("failed requesting JVM platform manifest: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("failed fetching JVM platform manifest: {e}"))?
+        .json()
+        .map_err(|e| format!("failed parsing JVM platform manifest: {e}"))?;
+
+    let runtime_root = minecraft_dir
+        .join("runtime")
+        .join(jvm_component)
+        .join(platform)
+        .join(jvm_component);
+    fs::create_dir_all(&runtime_root)
+        .map_err(|e| format!("failed creating runtime dir '{}': {e}", runtime_root.display()))?;
+
+    for (rel_path, file_entry) in platform_manifest.files {
+        let Some(kind) = file_entry.kind.as_deref() else {
+            continue;
+        };
+
+        let destination = runtime_safe_join(&runtime_root, &rel_path)?;
+        match kind {
+            "directory" => {
+                fs::create_dir_all(&destination).map_err(|e| {
+                    format!("failed creating runtime directory '{}': {e}", destination.display())
+                })?;
+            }
+            "file" => {
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent).map_err(|e| {
+                        format!("failed creating runtime parent '{}': {e}", parent.display())
+                    })?;
+                }
+
+                let downloads = file_entry.downloads.ok_or_else(|| {
+                    format!("runtime manifest missing download metadata for '{}': {}", jvm_component, rel_path)
+                })?;
+
+                let bytes = client
+                    .get(&downloads.raw.url)
+                    .send()
+                    .map_err(|e| format!("failed downloading runtime file '{}': {e}", rel_path))?
+                    .error_for_status()
+                    .map_err(|e| format!("failed downloading runtime file '{}': {e}", rel_path))?
+                    .bytes()
+                    .map_err(|e| format!("failed reading runtime file '{}': {e}", rel_path))?;
+
+                let hash = format!("{:x}", Sha1::digest(&bytes));
+                if !hash.eq_ignore_ascii_case(&downloads.raw.sha1) {
+                    return Err(format!(
+                        "sha1 mismatch for runtime file '{}': expected {}, got {}",
+                        rel_path, downloads.raw.sha1, hash
+                    ));
+                }
+
+                fs::write(&destination, &bytes).map_err(|e| {
+                    format!("failed writing runtime file '{}': {e}", destination.display())
+                })?;
+
+                #[cfg(unix)]
+                {
+                    if file_entry.executable.unwrap_or(false) {
+                        use std::os::unix::fs::PermissionsExt;
+                        let mut perms = fs::metadata(&destination)
+                            .map_err(|e| {
+                                format!(
+                                    "failed reading runtime file metadata '{}': {e}",
+                                    destination.display()
+                                )
+                            })?
+                            .permissions();
+                        perms.set_mode(0o755);
+                        fs::set_permissions(&destination, perms).map_err(|e| {
+                            format!(
+                                "failed setting runtime file permissions '{}': {e}",
+                                destination.display()
+                            )
+                        })?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
 }
 
 fn resolve_preferred_java_executable(java_path_raw: &str) -> Result<Option<PathBuf>, String> {
