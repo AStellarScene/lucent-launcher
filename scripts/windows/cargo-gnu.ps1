@@ -18,7 +18,9 @@ if (-not (Test-Path (Join-Path $cargoBin "cargo.exe"))) {
 }
 
 $env:PATH = "$mingwBin;$cargoBin;$env:PATH"
+$env:PKG_CONFIG = "C:/msys64/mingw64/bin/pkg-config.exe"
 $env:PKG_CONFIG_PATH = "C:/msys64/mingw64/lib/pkgconfig;C:/msys64/mingw64/share/pkgconfig"
+$env:PKG_CONFIG_ALLOW_SYSTEM_CFLAGS = "1"
 
 if (-not $CargoArgs -or $CargoArgs.Count -eq 0) {
     $CargoArgs = @("check")

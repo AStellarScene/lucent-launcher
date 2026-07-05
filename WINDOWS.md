@@ -36,7 +36,8 @@ Use the wrapper script (it sets required environment variables):
 
 ## Notes
 
-- `.cargo/config.toml` pins linker and `pkg-config` to `C:/msys64/mingw64/bin`.
+- `.cargo/config.toml` pins the Windows GNU linker/ar paths.
+- `scripts/windows/cargo-gnu.ps1` sets `PKG_CONFIG` and `PKG_CONFIG_PATH` for MSYS2.
 - Runtime still expects `src/ui/launcher.ui` relative to repository root.
 - If `winget` is unavailable, install MSYS2 manually, then run:
   - `pacman -Syu --noconfirm`
