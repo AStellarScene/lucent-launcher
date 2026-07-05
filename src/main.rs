@@ -12,12 +12,13 @@ use sha1::{Digest, Sha1};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::rc::Rc;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1387,6 +1388,98 @@ fn ensure_launcher_profiles_json(minecraft_dir: &Path) -> Result<(), String> {
         .map_err(|e| format!("failed serializing launcher_profiles.json scaffold: {e}"))?;
     fs::write(&launcher_profiles_path, content)
         .map_err(|e| format!("failed writing '{}': {e}", launcher_profiles_path.display()))
+}
+
+fn java_binary_names() -> &'static [&'static str] {
+    #[cfg(target_os = "windows")]
+    {
+        &["java.exe", "java"]
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        &["java"]
+    }
+}
+
+fn discover_java_from_env() -> Option<PathBuf> {
+    if let Some(java_home) = std::env::var_os("JAVA_HOME") {
+        let java_home = PathBuf::from(java_home);
+        for bin in java_binary_names() {
+            let candidate = java_home.join("bin").join(bin);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    if let Some(path_os) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_os) {
+            for bin in java_binary_names() {
+                let candidate = dir.join(bin);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn resolve_preferred_java_executable(java_path_raw: &str) -> Result<Option<PathBuf>, String> {
+    let trimmed = java_path_raw.trim();
+    if !trimmed.is_empty() && trimmed != "/path/to/binary" {
+        let direct = PathBuf::from(trimmed);
+        if direct.is_file() {
+            return Ok(Some(direct));
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            if direct.extension().is_none() {
+                let with_exe = direct.with_extension("exe");
+                if with_exe.is_file() {
+                    return Ok(Some(with_exe));
+                }
+            }
+        }
+
+        return Err(format!(
+            "Configured Java binary does not exist: {}",
+            direct.display()
+        ));
+    }
+
+    Ok(discover_java_from_env())
+}
+
+fn spawn_progress_heartbeat(
+    tx: &mpsc::Sender<LauncherMessage>,
+    stage: &str,
+    interval: Duration,
+) -> Arc<AtomicBool> {
+    let running = Arc::new(AtomicBool::new(true));
+    let running_bg = Arc::clone(&running);
+    let tx_bg = tx.clone();
+    let stage_label = stage.to_string();
+
+    thread::spawn(move || {
+        let started = Instant::now();
+        while running_bg.load(Ordering::Relaxed) {
+            thread::sleep(interval);
+            if !running_bg.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let _ = tx_bg.send(LauncherMessage::Log(format!(
+                "[progress] {} still running ({}s elapsed)...",
+                stage_label,
+                started.elapsed().as_secs()
+            )));
+        }
+    });
+
+    running
 }
 
 fn install_forge_profile_with_java(
@@ -4204,6 +4297,28 @@ fn build_ui(app: &Application) {
                 )))
                 .unwrap();
 
+            let preferred_java = match resolve_preferred_java_executable(&java_path_raw) {
+                Ok(java) => java,
+                Err(e) => {
+                    let _ = thread_tx.send(LauncherMessage::TaskFailed(format!(
+                        "Java configuration error: {}",
+                        e
+                    )));
+                    return;
+                }
+            };
+            if let Some(java) = &preferred_java {
+                let _ = thread_tx.send(LauncherMessage::Log(format!(
+                    "Using Java executable: {}",
+                    java.display()
+                )));
+            } else {
+                let _ = thread_tx.send(LauncherMessage::Log(
+                    "No explicit Java binary configured; relying on launcher/runtime defaults"
+                        .to_string(),
+                ));
+            }
+
             let mc_dir = match minecraft_root_dir() {
                 Ok(path) => path,
                 Err(e) => {
@@ -4246,13 +4361,29 @@ fn build_ui(app: &Application) {
             };
 
             let installed_version_id = if let Some(forge_version) = resolved_forge_version {
-                match install_forge_profile_with_java(
+                let _ = thread_tx.send(LauncherMessage::Log(
+                    "Starting Forge installation pipeline (this can take a few minutes)..."
+                        .to_string(),
+                ));
+                let install_progress = spawn_progress_heartbeat(
+                    &thread_tx,
+                    "Forge installation",
+                    Duration::from_secs(12),
+                );
+                let forge_java_path = preferred_java
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| java_path_raw.clone());
+                let install_result = install_forge_profile_with_java(
                     &launcher,
                     &selected_profile.version_id,
                     &forge_version,
-                    &java_path_raw,
+                    &forge_java_path,
                     &thread_tx,
-                ) {
+                );
+                install_progress.store(false, Ordering::Relaxed);
+
+                match install_result {
                     Ok(version_id) => version_id,
                     Err(e) => {
                         let _ = thread_tx.send(LauncherMessage::TaskFailed(format!(
@@ -4301,7 +4432,19 @@ fn build_ui(app: &Application) {
                     java: java_install_policy,
                 };
 
-                match launcher.install(install_req) {
+                let _ = thread_tx.send(LauncherMessage::Log(
+                    "Installing Minecraft/loader assets (this can take a few minutes on first run)..."
+                        .to_string(),
+                ));
+                let install_progress = spawn_progress_heartbeat(
+                    &thread_tx,
+                    "Minecraft + loader install",
+                    Duration::from_secs(12),
+                );
+                let install_result = launcher.install(install_req);
+                install_progress.store(false, Ordering::Relaxed);
+
+                match install_result {
                     Ok(install_res) => install_res.version_id,
                     Err(e) => {
                         let _ = thread_tx.send(LauncherMessage::TaskFailed(format!(
@@ -4320,7 +4463,15 @@ fn build_ui(app: &Application) {
                 )))
                 .unwrap();
 
-            match launcher.load_version(&installed_version_id) {
+            let load_progress = spawn_progress_heartbeat(
+                &thread_tx,
+                "Loading installed version metadata",
+                Duration::from_secs(10),
+            );
+            let load_result = launcher.load_version(&installed_version_id);
+            load_progress.store(false, Ordering::Relaxed);
+
+            match load_result {
                 Ok(version_meta) => {
                             if let Err(e) = ensure_maven_fallback_libraries_present(
                                 &version_meta,
@@ -4422,8 +4573,8 @@ fn build_ui(app: &Application) {
                                 }
                             }
 
-                            if !java_path_raw.is_empty() && java_path_raw != "/path/to/binary" {
-                                options.java_executable = Some(PathBuf::from(java_path_raw));
+                            if let Some(java) = &preferred_java {
+                                options.java_executable = Some(java.clone());
                             }
 
                             match launcher.build_launch_command_from_version(&version_meta, options) {
@@ -4458,12 +4609,34 @@ fn build_ui(app: &Application) {
                                         ))
                                         .unwrap();
 
-                                    let child_res = std::process::Command::new(&launch_cmd.executable)
-                                        .args(&launch_cmd.args)
-                                        .current_dir(&launch_cmd.working_dir)
-                                        .stdout(Stdio::piped())
-                                        .stderr(Stdio::piped())
-                                        .spawn();
+                                    let _ = thread_tx.send(LauncherMessage::Log(format!(
+                                        "Launch command executable: {}",
+                                        launch_cmd.executable.display()
+                                    )));
+
+                                    let spawn_with = |exe: &Path| {
+                                        std::process::Command::new(exe)
+                                            .args(&launch_cmd.args)
+                                            .current_dir(&launch_cmd.working_dir)
+                                            .stdout(Stdio::piped())
+                                            .stderr(Stdio::piped())
+                                            .spawn()
+                                    };
+
+                                    let mut child_res = spawn_with(&launch_cmd.executable);
+                                    if let Err(err) = &child_res {
+                                        if err.kind() == io::ErrorKind::NotFound {
+                                            if let Some(java) = &preferred_java {
+                                                if java != &launch_cmd.executable {
+                                                    let _ = thread_tx.send(LauncherMessage::Log(format!(
+                                                        "Launch executable not found; retrying with resolved Java: {}",
+                                                        java.display()
+                                                    )));
+                                                    child_res = spawn_with(java);
+                                                }
+                                            }
+                                        }
+                                    }
 
                                     match child_res {
                                         Ok(mut child) => {
@@ -4540,11 +4713,10 @@ fn build_ui(app: &Application) {
                                             }
                                         }
                                         Err(e) => {
-                                            thread_tx
-                                                .send(LauncherMessage::TaskFailed(format!(
-                                                    "Failed to spawn Java execution process: {e}"
-                                                )))
-                                                .unwrap();
+                                            let _ = thread_tx.send(LauncherMessage::TaskFailed(format!(
+                                                "Failed to spawn Java execution process: {}. Configure a valid Java binary in Profile Editor > Runtime Settings (or set JAVA_HOME).",
+                                                e
+                                            )));
                                         }
                                     }
                                 }
