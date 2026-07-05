@@ -22,6 +22,7 @@ install/launch logic is delegated to
 | `serde` / `serde_json` | 1.x |
 | `reqwest` | 0.13 (blocking/json/rustls) |
 | `url` | 2 |
+| `sha1` | 0.10 |
 
 Keep GTK/Adwaita pinned as above; APIs differ across releases.
 
@@ -64,10 +65,11 @@ cargo run
 Runtime requirements / gotchas:
 
 - GTK requires a display (headless requires virtual display).
-- `launcher.ui` is loaded from relative path (`src/ui/launcher.ui`) so run from project root.
-- Runtime root is `.minecraft` under current working directory.
-- Active launch game directory is profile-scoped (`.minecraft/profiles/<profile-name>`).
-- Profile persistence file is `profiles.json` in current working directory.
+- UI is loaded from embedded GResource (`/com/lucentlauncher/ui/launcher.ui`).
+- Runtime root is `.minecraft` under OS app-data path (`LUCENT_DATA_DIR` overrides).
+- Active launch game directory is profile-scoped (`<app-data>/.minecraft/profiles/<profile-name>`).
+- Profile persistence file is `<app-data>/profiles.json`.
+- Legacy data in working directory is migrated when app-data is empty; on migration failure launcher falls back to legacy path for safety.
 
 ---
 
@@ -104,6 +106,11 @@ Each profile stores:
 - loader kind (`Vanilla`, `Fabric`, `Quilt`, `Forge`, `NeoForge`)
 - loader version mode (`LatestStable`, `Latest`, `Exact(...)`)
 - card color mode (`Auto`, `Custom`) + optional color hex
+- runtime settings:
+  - Java auto-download policy (`Auto`, `Never`)
+  - optional Java binary path
+  - optional memory limit in MB (`-Xmx` override)
+  - optional extra JVM arguments (whitespace-split)
 
 Profile actions:
 - create / save / delete
@@ -127,19 +134,30 @@ Launch worker pipeline:
 1. Resolve loader/install strategy from selected profile.
    - Forge uses a custom installer path (captures installer stdout/stderr and ensures `launcher_profiles.json`).
    - Non-Forge loaders use `Launcher::install(request)`.
+  - `InstallRequest.java` is profile-driven (`Auto`/`Never`).
 2. `Launcher::load_version(version_id)`.
 3. Ensure fallback Maven libraries exist for libs that omit `downloads.artifact`.
-4. Build launch command (`build_launch_command_from_version(...)`).
-5. Set `LaunchOptions.game_directory` to profile-scoped directory.
-6. Dedupe conflicting classpath entries where needed.
-7. Spawn Java process, stream stdout/stderr into Console Log, wait for exit.
+4. Set `LaunchOptions.game_directory` to profile-scoped directory.
+5. Run launch-time mod repair for selected profile:
+  - check enabled mod jars against Modrinth hash metadata
+  - if incompatible, try compatible update retrieval first
+  - only disable as fallback (`.disabled`) when no compatible replacement exists
+  - abort launch and report disabled mods if any had to be disabled
+6. Build launch command (`build_launch_command_from_version(...)`).
+  - apply profile runtime overrides (`java_executable`, memory, extra JVM args)
+7. Dedupe conflicting classpath entries where needed.
+8. Spawn Java process, stream stdout/stderr into Console Log, wait for exit.
 
 ### Mods / shaders workflow (Profile Editor)
 - Mods and shaders are managed from Profile Editor via Adwaita bottom sheets:
   - `sheet_profile_mods`
   - `sheet_profile_shaders`
 - Search uses Modrinth API and renders selectable result cards with checkboxes.
+- Search cards intentionally do not render project avatars/icons.
 - Install action supports multi-select batch install.
+- Selection behavior in Search tab:
+  - checked items float into a `Selected for install` section at the top
+  - selection persists across repeated searches while sheet is open
 - Compatibility is filtered client-side before download:
   - Mods: `game_versions` + loader
   - Shaders: `game_versions`
@@ -173,7 +191,11 @@ Launch worker pipeline:
 - `row_profile_loader_version_exact` — exact loader version input
 - `btn_profile_create`, `btn_profile_save`, `btn_profile_delete`
 - `btn_profile_manage_mods`, `btn_profile_manage_shaders`
-- `row_java_binary` — optional Java executable override
+- Runtime settings:
+  - `dropdown_profile_runtime_java_policy` — Java install policy (`Auto`/`Never`)
+  - `row_java_binary` — optional Java executable override
+  - `row_profile_runtime_memory_mb` — optional `-Xmx` MB limit
+  - `row_profile_runtime_jvm_args` — optional extra JVM args
 
 ### Profile Editor bottom sheets
 - Mods sheet:
@@ -216,4 +238,5 @@ Stack pages: `page_account`, `page_home`, `page_console`, `page_profile`.
 - **No real percentage progress yet:** progress bar is still indeterminate.
 - **Single-file app logic:** `main.rs` is large; candidate for modular split
   (auth, profiles, launch, messaging, persistence).
-- **UI path is still relative:** for portability, bundle UI with `gio::Resource`.
+- **JVM args parsing is basic:** extra JVM arguments are split on whitespace;
+  quoting/escaped spaces are not currently supported.
