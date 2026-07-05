@@ -28,16 +28,61 @@ Use the wrapper script (it sets required environment variables):
 ./scripts/windows/cargo-gnu.ps1 clippy --all-targets
 ```
 
+Windows GNU builds now include static Rust runtime flags via `.cargo/config.toml`:
+- `-C target-feature=+crt-static`
+- `-C link-arg=-static-libgcc`
+
 ## 3) Run
 
 ```powershell
 ./scripts/windows/cargo-gnu.ps1 run
 ```
 
+## 4) Portable (self-contained folder)
+
+To produce a self-contained Windows app folder (exe + required GTK/MSYS2 DLLs):
+
+```powershell
+./scripts/windows/build-portable.ps1 -Zip
+```
+
+Artifacts:
+- `dist/windows-portable/`
+- `dist/lucent-launcher-windows-portable.zip`
+
+## 5) MSIX installer
+
+Create an MSIX package from the portable bundle:
+
+```powershell
+./scripts/windows/build-msix.ps1 -Version 0.1.0.0
+```
+
+This script:
+- builds portable files (unless `-SkipPortableBuild`)
+- generates `AppxManifest.xml` from template
+- creates package at `dist/msix/<PackageName>_<Version>_x64.msix`
+- signs package (default: auto-generated dev cert)
+
+Useful options:
+
+```powershell
+# Use your own signing certificate
+./scripts/windows/build-msix.ps1 -Version 0.1.0.0 -CertificatePfxPath C:\certs\code-signing.pfx -CertificatePassword (ConvertTo-SecureString "<password>" -AsPlainText -Force)
+
+# Build unsigned (for CI handoff to separate signing step)
+./scripts/windows/build-msix.ps1 -Version 0.1.0.0 -Unsigned
+
+# Reuse existing portable output
+./scripts/windows/build-msix.ps1 -Version 0.1.0.0 -SkipPortableBuild
+```
+
 ## Notes
 
 - `.cargo/config.toml` pins the Windows GNU linker/ar paths.
 - `scripts/windows/cargo-gnu.ps1` sets `PKG_CONFIG` and `PKG_CONFIG_PATH` for MSYS2.
+- A true single-file GTK executable is not supported with the MSYS2 GTK stack; use the portable folder/zip artifact.
+- MSIX tooling requires Windows SDK (`makeappx.exe`, `signtool.exe`).
 - Runtime still expects `src/ui/launcher.ui` relative to repository root.
 - If `winget` is unavailable, install MSYS2 manually, then run:
   - `pacman -Syu --noconfirm`

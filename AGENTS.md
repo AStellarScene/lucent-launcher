@@ -32,10 +32,21 @@ Keep GTK/Adwaita pinned as above; APIs differ across releases.
 
 ```text
 lucent-launcher/
+├── .cargo/
+│   └── config.toml       # Windows GNU linker + rustflags
 ├── Cargo.toml            # dependencies & metadata
 ├── Cargo.lock
 ├── AGENTS.md             # this file
+├── WINDOWS.md            # Windows setup/build/packaging guide
 ├── profiles.json         # persisted launcher profiles (created at runtime)
+├── scripts/
+│   └── windows/
+│       ├── setup-gtk.ps1     # installs MSYS2 + GTK + Rust GNU toolchain
+│       ├── cargo-gnu.ps1     # wrapper for cargo with MSYS2 env vars
+│       ├── build-portable.ps1# creates portable app folder/zip (exe + DLLs)
+│       ├── build-msix.ps1    # builds and signs MSIX from portable bundle
+│       └── msix/
+│           └── AppxManifest.xml.template
 ├── src/
 │   ├── main.rs           # app logic (single-file for now)
 │   └── ui/
@@ -62,6 +73,23 @@ cargo build --release
 cargo run
 ```
 
+### Windows (GNU + MSYS2)
+
+Use the Windows wrapper scripts instead of plain cargo:
+
+```powershell
+./scripts/windows/setup-gtk.ps1
+./scripts/windows/cargo-gnu.ps1 build --release
+./scripts/windows/build-portable.ps1 -Zip
+./scripts/windows/build-msix.ps1 -Version 0.1.0.0
+```
+
+Packaging notes:
+- Portable output lives in `dist/windows-portable/` and optional zip output in `dist/lucent-launcher-windows-portable.zip`.
+- MSIX output lives in `dist/msix/`.
+- MSIX requires Windows SDK tooling (`makeappx.exe`, `signtool.exe`).
+- A true single-file GTK executable is not expected with MSYS2 GTK; ship exe plus DLLs.
+
 Runtime requirements / gotchas:
 
 - GTK requires a display (headless requires virtual display).
@@ -70,6 +98,7 @@ Runtime requirements / gotchas:
 - Active launch game directory is profile-scoped (`<app-data>/.minecraft/profiles/<profile-name>`).
 - Profile persistence file is `<app-data>/profiles.json`.
 - Legacy data in working directory is migrated when app-data is empty; on migration failure launcher falls back to legacy path for safety.
+- Windows GNU target uses static Rust runtime flags in `.cargo/config.toml` (`crt-static` + `-static-libgcc`), while GTK/Libadwaita remain dynamically loaded.
 
 ---
 
