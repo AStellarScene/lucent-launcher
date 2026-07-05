@@ -102,16 +102,14 @@
                     </child>
 
                     <child>
-                      <object class="GtkFlowBox" id="flow_home_profiles">
-                        <property name="selection-mode">none</property>
-                        <property name="column-spacing">12</property>
-                        <property name="row-spacing">12</property>
-                        <property name="max-children-per-line">99</property>
-                        <property name="min-children-per-line">1</property>
-                        <property name="homogeneous">false</property>
-                        <property name="activate-on-single-click">false</property>
+                      <object class="AdwWrapBox" id="flow_home_profiles">
+                        <property name="child-spacing">12</property>
+                        <property name="line-spacing">12</property>
+                        <property name="natural-line-length">980</property>
+                        <property name="line-homogeneous">false</property>
                         <property name="halign">fill</property>
                         <property name="valign">start</property>
+                        <property name="hexpand">true</property>
                       </object>
                     </child>
                   </object>
@@ -274,15 +272,15 @@
                                   </object>
                                 </child>
                                 <child>
-                                  <object class="GtkButton" id="btn_profile_save">
-                                    <property name="label">Save Changes</property>
-                                    <style><class name="pill"/></style>
+                                  <object class="GtkButton" id="btn_profile_delete">
+                                    <property name="label">Delete</property>
+                                    <style><class name="destructive-action"/></style>
                                   </object>
                                 </child>
                                 <child>
-                                  <object class="GtkButton" id="btn_profile_delete">
-                                    <property name="label">Delete</property>
-                                    <style><class name="pill"/></style>
+                                  <object class="GtkButton" id="btn_profile_save">
+                                    <property name="label">Save Changes</property>
+                                    <style><class name="suggested-action"/></style>
                                   </object>
                                 </child>
                               </object>

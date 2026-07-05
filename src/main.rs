@@ -1,5 +1,5 @@
 use adw::prelude::*;
-use adw::{ActionRow, Application, ApplicationWindow, BottomSheet, EntryRow};
+use adw::{ActionRow, Application, ApplicationWindow, BottomSheet, EntryRow, WrapBox};
 use gtk::{
     Box as GtkBox, Button, CheckButton, CssProvider, DropDown, Entry as GtkEntry, FlowBox, Frame,
     GestureClick, Label, Orientation, ProgressBar, Stack, StringList, Switch, TextView,
@@ -619,6 +619,76 @@ fn profile_gradient_colors(
     let c2 = hsl_to_rgb(hue2, 0.48, 0.64);
     let c3 = hsl_to_rgb(hue3, 0.42, 0.58);
     (c1, c2, c3)
+}
+
+fn profile_progress_bar_color(profile: &LauncherProfile) -> (u8, u8, u8) {
+    let (c1, c2, c3) = profile_gradient_colors(profile);
+    let blend = mix_rgb(c1, c2, 0.50);
+    mix_rgb(blend, c3, 0.35)
+}
+
+#[allow(deprecated)]
+fn apply_launch_profile_style(css_provider: &CssProvider, profile: Option<&LauncherProfile>) {
+    let base_color = match profile {
+        Some(profile) => {
+            let (r, g, b) = profile_progress_bar_color(profile);
+            (r, g, b)
+        }
+        None => (53, 132, 228),
+    };
+
+    let hover_color = mix_rgb(base_color, (255, 255, 255), 0.12);
+    let active_color = mix_rgb(base_color, (0, 0, 0), 0.14);
+
+    let progress_color = format!(
+        "rgba({}, {}, {}, 0.96)",
+        base_color.0, base_color.1, base_color.2
+    );
+    let launch_button_color = format!(
+        "rgba({}, {}, {}, 0.98)",
+        base_color.0, base_color.1, base_color.2
+    );
+    let launch_button_hover_color = format!(
+        "rgba({}, {}, {}, 0.98)",
+        hover_color.0, hover_color.1, hover_color.2
+    );
+    let launch_button_active_color = format!(
+        "rgba({}, {}, {}, 0.98)",
+        active_color.0, active_color.1, active_color.2
+    );
+
+    let css = format!(
+        "progressbar.launch-profile-progress > trough > progress,
+          progressbar.launch-profile-progress trough progress {{
+            background-image: none;
+            background-color: {progress_color};
+          }}
+
+                    button.suggested-action,
+                    menubutton.suggested-action > button,
+                    splitbutton.suggested-action > button,
+                    splitbutton.suggested-action > menubutton > button {{
+            background-image: none;
+            background-color: {launch_button_color};
+            color: #ffffff;
+          }}
+
+                    button.suggested-action:hover,
+                    menubutton.suggested-action > button:hover,
+                    splitbutton.suggested-action > button:hover,
+                    splitbutton.suggested-action > menubutton > button:hover {{
+            background-color: {launch_button_hover_color};
+          }}
+
+                    button.suggested-action:active,
+                    menubutton.suggested-action > button:active,
+                    splitbutton.suggested-action > button:active,
+                    splitbutton.suggested-action > menubutton > button:active {{
+            background-color: {launch_button_active_color};
+          }}"
+    );
+
+    css_provider.load_from_data(&css);
 }
 
 #[allow(deprecated)]
@@ -2472,9 +2542,20 @@ fn build_ui(app: &Application) {
     let lbl_welcome_user: Label = builder.object("lbl_welcome_user").unwrap();
     let lbl_ready_status: Label = builder.object("lbl_ready_status").unwrap();
     let text_view: TextView = builder.object("text_view").unwrap();
-    let flow_home_profiles: FlowBox = builder.object("flow_home_profiles").unwrap();
+    let flow_home_profiles: WrapBox = builder.object("flow_home_profiles").unwrap();
     let progress_bar: ProgressBar = builder.object("progress_bar").unwrap();
     let bottom_deck: gtk::Widget = builder.object("bottom_deck").unwrap();
+
+    let launch_progress_css = CssProvider::new();
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &launch_progress_css,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+    progress_bar.add_css_class("launch-profile-progress");
+    apply_launch_profile_style(&launch_progress_css, None);
 
     let btn_profile_manage_mods: Button = builder.object("btn_profile_manage_mods").unwrap();
     let btn_profile_manage_shaders: Button = builder.object("btn_profile_manage_shaders").unwrap();
@@ -3277,13 +3358,7 @@ fn build_ui(app: &Application) {
             card_root.append(&info_box);
             card_frame.set_child(Some(&card_root));
 
-            flow_home_profiles_render.insert(&card_frame, -1);
-            if let Some(parent) = card_frame.parent() {
-                if let Ok(flow_child) = parent.downcast::<gtk::FlowBoxChild>() {
-                    flow_child.set_halign(gtk::Align::Start);
-                    flow_child.set_valign(gtk::Align::Start);
-                }
-            }
+            flow_home_profiles_render.append(&card_frame);
         }
     });
 
@@ -3325,6 +3400,7 @@ fn build_ui(app: &Application) {
     let btn_profile_delete_refresh = btn_profile_delete.clone();
     let current_session_refresh = current_session.clone();
     let btn_play_refresh = btn_play.clone();
+    let launch_progress_css_refresh = launch_progress_css.clone();
 
     let render_home_cards_for_refresh = render_home_cards.clone();
     let refresh_profile_models: Rc<dyn Fn(Option<String>)> =
@@ -3368,6 +3444,7 @@ fn build_ui(app: &Application) {
                 btn_profile_save_refresh.set_sensitive(false);
                 btn_profile_delete_refresh.set_sensitive(false);
                 btn_play_refresh.set_sensitive(false);
+                apply_launch_profile_style(&launch_progress_css_refresh, None);
                 (render_home_cards_for_refresh)();
                 return;
             }
@@ -3463,6 +3540,10 @@ fn build_ui(app: &Application) {
             btn_profile_delete_refresh.set_sensitive(profile_list.len() > 1);
             btn_play_refresh.set_sensitive(
                 current_session_refresh.borrow().is_some() && !profile_list.is_empty(),
+            );
+            apply_launch_profile_style(
+                &launch_progress_css_refresh,
+                profile_list.get(selected_idx),
             );
             (render_home_cards_for_refresh)();
         });
@@ -3562,6 +3643,8 @@ fn build_ui(app: &Application) {
         refresh_mods_installed_for_selected_profile.clone();
     let refresh_shaders_installed_on_profile_change =
         refresh_shaders_installed_for_selected_profile.clone();
+    let profiles_for_launch_theme_sync = profiles.clone();
+    let launch_progress_css_sync = launch_progress_css.clone();
     dropdown_profile_editor.connect_selected_notify(move |editor_dropdown| {
         let idx = editor_dropdown.selected() as usize;
         dropdown_profile_launch_sync.set_selected(idx as u32);
@@ -3600,8 +3683,22 @@ fn build_ui(app: &Application) {
             );
             row_profile_runtime_jvm_args_sync.set_text(profile.java_args.as_deref().unwrap_or(""));
         }
+        apply_launch_profile_style(
+            &launch_progress_css_sync,
+            profiles_for_launch_theme_sync.borrow().get(idx),
+        );
         (refresh_mods_installed_on_profile_change)();
         (refresh_shaders_installed_on_profile_change)();
+    });
+
+    let profiles_for_launch_dropdown_theme = profiles.clone();
+    let launch_progress_css_dropdown = launch_progress_css.clone();
+    dropdown_profile_launch.connect_selected_notify(move |dropdown| {
+        let idx = dropdown.selected() as usize;
+        apply_launch_profile_style(
+            &launch_progress_css_dropdown,
+            profiles_for_launch_dropdown_theme.borrow().get(idx),
+        );
     });
 
     let row_loader_exact_mode = row_profile_loader_version_exact.clone();
@@ -3885,32 +3982,73 @@ fn build_ui(app: &Application) {
     let refresh_mods_after_delete = refresh_mods_installed_for_selected_profile.clone();
     let refresh_shaders_after_delete = refresh_shaders_installed_for_selected_profile.clone();
     let lbl_status_delete = lbl_ready_status.clone();
-    btn_profile_delete.connect_clicked(move |_| {
+    btn_profile_delete.connect_clicked(move |btn| {
         let idx = dropdown_profile_editor_delete.selected() as usize;
-        let mut profile_list = profiles_delete.borrow_mut();
+        let profile_name = {
+            let profile_list = profiles_delete.borrow();
 
-        if profile_list.len() <= 1 {
-            lbl_status_delete.set_label("At least one profile is required");
-            return;
-        }
-        if idx >= profile_list.len() {
-            lbl_status_delete.set_label("No profile selected");
-            return;
-        }
+            if profile_list.len() <= 1 {
+                lbl_status_delete.set_label("At least one profile is required");
+                return;
+            }
+            if idx >= profile_list.len() {
+                lbl_status_delete.set_label("No profile selected");
+                return;
+            }
 
-        profile_list.remove(idx);
-        let save_res = save_profiles_to_disk(&profile_list);
-        drop(profile_list);
+            profile_list[idx].name.clone()
+        };
 
-        if let Err(e) = save_res {
-            lbl_status_delete.set_label("Profile deleted, but disk write failed");
-            eprintln!("{e}");
-        }
+        let dialog = adw::AlertDialog::new(
+            Some("Delete profile?"),
+            Some(&format!(
+                "Are you sure you want to delete profile \"{}\"? This cannot be undone.",
+                profile_name
+            )),
+        );
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("delete", "Delete");
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
 
-        (refresh_after_delete)(None);
-        (refresh_mods_after_delete)();
-        (refresh_shaders_after_delete)();
-        lbl_status_delete.set_label("Profile deleted");
+        let profiles_delete_confirm = profiles_delete.clone();
+        let refresh_after_delete_confirm = refresh_after_delete.clone();
+        let refresh_mods_after_delete_confirm = refresh_mods_after_delete.clone();
+        let refresh_shaders_after_delete_confirm = refresh_shaders_after_delete.clone();
+        let lbl_status_delete_confirm = lbl_status_delete.clone();
+
+        dialog.choose(Some(btn), None::<&gtk::gio::Cancellable>, move |response| {
+            if response != "delete" {
+                return;
+            }
+
+            let mut profile_list = profiles_delete_confirm.borrow_mut();
+
+            if profile_list.len() <= 1 {
+                lbl_status_delete_confirm.set_label("At least one profile is required");
+                return;
+            }
+
+            let Some(delete_idx) = profile_list.iter().position(|p| p.name == profile_name) else {
+                lbl_status_delete_confirm.set_label("Profile no longer exists");
+                return;
+            };
+
+            profile_list.remove(delete_idx);
+            let save_res = save_profiles_to_disk(&profile_list);
+            drop(profile_list);
+
+            if let Err(e) = save_res {
+                lbl_status_delete_confirm.set_label("Profile deleted, but disk write failed");
+                eprintln!("{e}");
+            }
+
+            (refresh_after_delete_confirm)(None);
+            (refresh_mods_after_delete_confirm)();
+            (refresh_shaders_after_delete_confirm)();
+            lbl_status_delete_confirm.set_label("Profile deleted");
+        });
     });
 
     // Offline login.
@@ -4307,6 +4445,8 @@ fn build_ui(app: &Application) {
     let render_shaders_cards_poll = render_shaders_cards.clone();
     let refresh_mods_installed_poll = refresh_mods_installed_for_selected_profile.clone();
     let refresh_shaders_installed_poll = refresh_shaders_installed_for_selected_profile.clone();
+    let launch_progress_css_poll = launch_progress_css.clone();
+    let launch_dropdown_poll = dropdown_profile_launch.clone();
 
     glib::source::timeout_add_local(Duration::from_millis(50), move || {
         while let Ok(msg) = rx.try_recv() {
@@ -4375,6 +4515,9 @@ fn build_ui(app: &Application) {
                     task_active_poll.set(false);
                     progress_bar_clone.set_visible(false);
                     progress_bar_clone.set_fraction(0.0);
+                    let selected_idx = launch_dropdown_poll.selected() as usize;
+                    let profile = profiles_poll.borrow().get(selected_idx).cloned();
+                    apply_launch_profile_style(&launch_progress_css_poll, profile.as_ref());
                 }
                 LauncherMessage::TaskFailed(err) => {
                     lbl_status_clone.set_label("Execution Error!");
@@ -4388,6 +4531,9 @@ fn build_ui(app: &Application) {
                     task_active_poll.set(false);
                     progress_bar_clone.set_visible(false);
                     progress_bar_clone.set_fraction(0.0);
+                    let selected_idx = launch_dropdown_poll.selected() as usize;
+                    let profile = profiles_poll.borrow().get(selected_idx).cloned();
+                    apply_launch_profile_style(&launch_progress_css_poll, profile.as_ref());
                 }
                 LauncherMessage::OpenUrl(url) => {
                     if let Err(e) = gtk::gio::AppInfo::launch_default_for_uri(
@@ -4504,6 +4650,7 @@ fn build_ui(app: &Application) {
 
     let progress_bar_launch = progress_bar.clone();
     let task_active_launch = task_active.clone();
+    let launch_progress_css_launch = launch_progress_css.clone();
 
     btn_play.connect_clicked(move |button| {
         let session = match current_session_launch.borrow().clone() {
@@ -4527,10 +4674,12 @@ fn build_ui(app: &Application) {
                     button.set_sensitive(true);
                     task_active_launch.set(false);
                     progress_bar_launch.set_visible(false);
+                    apply_launch_profile_style(&launch_progress_css_launch, None);
                     return;
                 }
             }
         };
+        apply_launch_profile_style(&launch_progress_css_launch, Some(&selected_profile));
         let target_version = selected_profile.version_id.clone();
 
         if !available_versions
@@ -4546,6 +4695,7 @@ fn build_ui(app: &Application) {
             task_active_launch.set(false);
             progress_bar_launch.set_visible(false);
             progress_bar_launch.set_fraction(0.0);
+            apply_launch_profile_style(&launch_progress_css_launch, Some(&selected_profile));
             return;
         }
 
