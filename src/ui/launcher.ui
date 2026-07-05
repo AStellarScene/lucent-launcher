@@ -1,0 +1,679 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <requires lib="gtk" version="4.0"/>
+  <requires lib="libadwaita" version="1.0"/>
+
+  <object class="AdwToolbarView" id="toolbar_view">
+
+    <child type="top">
+      <object class="GtkHeaderBar" id="header_bar">
+        <property name="title-widget">
+          <object class="GtkStackSwitcher" id="view_switcher">
+            <property name="stack">view_stack</property>
+          </object>
+        </property>
+      </object>
+    </child>
+
+    <property name="content">
+      <object class="GtkStack" id="view_stack">
+        <property name="transition-type">slide-left-right</property>
+        <property name="transition-duration">250</property>
+
+        <child>
+          <object class="GtkStackPage">
+            <property name="name">page_account</property>
+            <property name="title">Account</property>
+            <property name="child">
+              <object class="AdwPreferencesPage" id="login_page">
+                <child>
+                  <object class="AdwPreferencesGroup">
+                    <property name="title">Player Login</property>
+                    <property name="description">Sign in with a player name to enable launching.</property>
+                    <child>
+                      <object class="AdwEntryRow" id="row_login_username">
+                        <property name="title">Player Username</property>
+                        <property name="text">Steve</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkButton" id="btn_login">
+                        <property name="label">Log In Offline</property>
+                        <property name="halign">center</property>
+                        <property name="margin-top">18</property>
+                        <property name="width-request">180</property>
+                        <style>
+                          <class name="suggested-action"/>
+                          <class name="pill"/>
+                        </style>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkButton" id="btn_login_microsoft">
+                        <property name="label">Sign In with Microsoft</property>
+                        <property name="halign">center</property>
+                        <property name="margin-top">8</property>
+                        <property name="width-request">220</property>
+                        <style>
+                          <class name="pill"/>
+                        </style>
+                      </object>
+                    </child>
+                  </object>
+                </child>
+                <child>
+                  <object class="AdwPreferencesGroup">
+                    <child>
+                      <object class="AdwActionRow" id="row_account_status">
+                        <property name="title">Current Session</property>
+                        <property name="subtitle">Not signed in</property>
+                      </object>
+                    </child>
+                  </object>
+                </child>
+              </object>
+            </property>
+          </object>
+        </child>
+
+        <child>
+          <object class="GtkStackPage">
+            <property name="name">page_home</property>
+            <property name="title">Home</property>
+            <property name="child">
+              <object class="GtkScrolledWindow" id="scroll_home">
+                <property name="hscrollbar-policy">never</property>
+                <property name="child">
+                  <object class="GtkBox" id="home_column">
+                    <property name="orientation">vertical</property>
+                    <property name="spacing">14</property>
+                    <property name="margin-start">20</property>
+                    <property name="margin-end">20</property>
+                    <property name="margin-top">20</property>
+                    <property name="margin-bottom">20</property>
+                    <child>
+                      <object class="GtkLabel" id="lbl_home_title">
+                        <property name="label">Welcome Back</property>
+                        <property name="halign">start</property>
+                        <style>
+                          <class name="title-2"/>
+                        </style>
+                      </object>
+                    </child>
+
+                    <child>
+                      <object class="GtkFlowBox" id="flow_home_profiles">
+                        <property name="selection-mode">none</property>
+                        <property name="column-spacing">12</property>
+                        <property name="row-spacing">12</property>
+                        <property name="max-children-per-line">99</property>
+                        <property name="min-children-per-line">1</property>
+                        <property name="homogeneous">false</property>
+                        <property name="activate-on-single-click">false</property>
+                        <property name="halign">fill</property>
+                        <property name="valign">start</property>
+                      </object>
+                    </child>
+                  </object>
+                </property>
+              </object>
+            </property>
+          </object>
+        </child>
+
+
+
+        <child>
+          <object class="GtkStackPage">
+            <property name="name">page_console</property>
+            <property name="title">Console Log</property>
+            <property name="child">
+              <object class="GtkScrolledWindow" id="scroll_log">
+                <property name="child">
+                  <object class="GtkTextView" id="text_view">
+                    <property name="editable">false</property>
+                    <property name="cursor-visible">false</property>
+                    <property name="margin-start">12</property>
+                    <property name="margin-end">12</property>
+                    <property name="margin-top">12</property>
+                    <property name="margin-bottom">12</property>
+                  </object>
+                </property>
+              </object>
+            </property>
+          </object>
+        </child>
+
+        <child>
+          <object class="GtkStackPage">
+            <property name="name">page_profile</property>
+            <property name="title">Profile Editor</property>
+            <property name="child">
+              <object class="AdwBottomSheet" id="sheet_profile_mods">
+                <property name="show-drag-handle">true</property>
+                <property name="modal">true</property>
+                <property name="full-width">true</property>
+                <property name="can-close">true</property>
+                <property name="open">false</property>
+                <property name="content">
+                  <object class="AdwBottomSheet" id="sheet_profile_shaders">
+                    <property name="show-drag-handle">true</property>
+                    <property name="modal">true</property>
+                    <property name="full-width">true</property>
+                    <property name="can-close">true</property>
+                    <property name="open">false</property>
+                    <property name="content">
+                      <object class="AdwPreferencesPage" id="profile_page">
+                        <property name="margin-top">12</property>
+                        <property name="margin-bottom">20</property>
+                        <child>
+                          <object class="AdwPreferencesGroup" id="profiles_group">
+                            <property name="title">Profiles</property>
+                            <property name="description">Create profiles and map each profile to a specific Minecraft version.</property>
+                            <child>
+                              <object class="AdwActionRow" id="row_profile_picker">
+                                <property name="title">Selected Profile</property>
+                                <property name="subtitle">Choose which profile to edit.</property>
+                                <child type="suffix">
+                                  <object class="GtkDropDown" id="dropdown_profile_editor">
+                                    <property name="valign">center</property>
+                                    <property name="width-request">220</property>
+                                  </object>
+                                </child>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="AdwEntryRow" id="row_profile_name">
+                                <property name="title">Profile Name</property>
+                                <property name="text">Default</property>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="AdwActionRow" id="row_profile_version_picker">
+                                <property name="title">Minecraft Version</property>
+                                <property name="subtitle">Version linked to this profile when launching.</property>
+                                <child type="suffix">
+                                  <object class="GtkDropDown" id="dropdown_profile_version">
+                                    <property name="valign">center</property>
+                                    <property name="width-request">220</property>
+                                  </object>
+                                </child>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="AdwActionRow" id="row_profile_loader_picker">
+                                <property name="title">Loader</property>
+                                <property name="subtitle">Choose vanilla or a mod loader for this profile.</property>
+                                <child type="suffix">
+                                  <object class="GtkDropDown" id="dropdown_profile_loader">
+                                    <property name="valign">center</property>
+                                    <property name="width-request">220</property>
+                                  </object>
+                                </child>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="AdwActionRow" id="row_profile_loader_version_mode_picker">
+                                <property name="title">Loader Version</property>
+                                <property name="subtitle">How to resolve loader version during install.</property>
+                                <child type="suffix">
+                                  <object class="GtkDropDown" id="dropdown_profile_loader_version_mode">
+                                    <property name="valign">center</property>
+                                    <property name="width-request">220</property>
+                                  </object>
+                                </child>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="AdwEntryRow" id="row_profile_loader_version_exact">
+                                <property name="title">Exact Loader Version</property>
+                                <property name="text"></property>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="AdwActionRow" id="row_profile_color_mode_picker">
+                                <property name="title">Card Color</property>
+                                <property name="subtitle">Choose automatic profile color or set your own hex color.</property>
+                                <child type="suffix">
+                                  <object class="GtkDropDown" id="dropdown_profile_color_mode">
+                                    <property name="valign">center</property>
+                                    <property name="width-request">220</property>
+                                  </object>
+                                </child>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="AdwEntryRow" id="row_profile_color_hex">
+                                <property name="title">Custom Color (Hex)</property>
+                                <property name="text">#7C5CFF</property>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkBox" id="profile_buttons_row">
+                                <property name="orientation">horizontal</property>
+                                <property name="spacing">8</property>
+                                <property name="margin-top">10</property>
+                                <property name="margin-bottom">4</property>
+                                <property name="halign">end</property>
+                                <child>
+                                  <object class="GtkButton" id="btn_profile_manage_mods">
+                                    <property name="label">Manage Mods</property>
+                                    <style><class name="pill"/></style>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkButton" id="btn_profile_manage_shaders">
+                                    <property name="label">Manage Shaders</property>
+                                    <style><class name="pill"/></style>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkButton" id="btn_profile_create">
+                                    <property name="label">Create</property>
+                                    <style><class name="pill"/></style>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkButton" id="btn_profile_save">
+                                    <property name="label">Save Changes</property>
+                                    <style><class name="pill"/></style>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkButton" id="btn_profile_delete">
+                                    <property name="label">Delete</property>
+                                    <style><class name="pill"/></style>
+                                  </object>
+                                </child>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="AdwPreferencesGroup" id="preferences_group">
+                            <property name="title">Runtime Settings</property>
+                            <property name="description">Optional overrides used when building the launch command.</property>
+                            <property name="margin-top">8</property>
+                            <child>
+                              <object class="AdwEntryRow" id="row_java_binary">
+                                <property name="title">Executable Runtime Path</property>
+                                <property name="text">/path/to/binary</property>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                      </object>
+                    </property>
+                    <property name="sheet">
+                      <object class="GtkBox" id="sheet_shaders_content">
+                        <property name="orientation">vertical</property>
+                        <property name="spacing">10</property>
+                        <property name="margin-start">20</property>
+                        <property name="margin-end">20</property>
+                        <property name="margin-top">16</property>
+                        <property name="margin-bottom">16</property>
+                        <child>
+                          <object class="GtkLabel" id="lbl_profile_shaders_sheet_title">
+                            <property name="label">Manage Shaders</property>
+                            <property name="halign">start</property>
+                            <style><class name="title-4"/></style>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkStackSwitcher" id="switcher_profile_shaders_tabs">
+                            <property name="halign">start</property>
+                            <property name="stack">stack_profile_shaders_tabs</property>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkStack" id="stack_profile_shaders_tabs">
+                            <property name="transition-type">slide-left-right</property>
+                            <child>
+                              <object class="GtkStackPage">
+                                <property name="name">installed</property>
+                                <property name="title">Installed</property>
+                                <property name="child">
+                                  <object class="GtkBox" id="box_profile_shaders_installed_tab">
+                                    <property name="orientation">vertical</property>
+                                    <property name="spacing">8</property>
+                                    <child>
+                                      <object class="GtkLabel" id="lbl_profile_shaders_installed_status">
+                                        <property name="label">Installed shaderpacks for this profile</property>
+                                        <property name="halign">start</property>
+                                        <style><class name="dim-label"/></style>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="GtkScrolledWindow" id="scroll_profile_shaders_installed">
+                                        <property name="hscrollbar-policy">never</property>
+                                        <property name="min-content-height">220</property>
+                                        <property name="max-content-height">280</property>
+                                        <property name="vexpand">true</property>
+                                        <property name="child">
+                                          <object class="GtkFlowBox" id="flow_profile_shaders_installed">
+                                            <property name="selection-mode">none</property>
+                                            <property name="column-spacing">8</property>
+                                            <property name="row-spacing">8</property>
+                                            <property name="max-children-per-line">1</property>
+                                            <property name="min-children-per-line">1</property>
+                                            <property name="activate-on-single-click">false</property>
+                                            <property name="valign">start</property>
+                                          </object>
+                                        </property>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </property>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkStackPage">
+                                <property name="name">search</property>
+                                <property name="title">Search</property>
+                                <property name="child">
+                                  <object class="GtkBox" id="box_profile_shaders_search_tab">
+                                    <property name="orientation">vertical</property>
+                                    <property name="spacing">8</property>
+                                    <child>
+                                      <object class="GtkBox" id="profile_shaders_search_row">
+                                        <property name="orientation">horizontal</property>
+                                        <property name="spacing">8</property>
+                                        <child>
+                                          <object class="GtkEntry" id="entry_profile_shaders_search">
+                                            <property name="hexpand">true</property>
+                                            <property name="placeholder-text">Search Modrinth shaders</property>
+                                          </object>
+                                        </child>
+                                        <child>
+                                          <object class="GtkButton" id="btn_profile_shaders_search">
+                                            <property name="label">Search</property>
+                                            <style><class name="suggested-action"/></style>
+                                          </object>
+                                        </child>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="GtkLabel" id="lbl_profile_shaders_results_status">
+                                        <property name="label">Search shaderpacks for this profile</property>
+                                        <property name="halign">start</property>
+                                        <style><class name="dim-label"/></style>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="GtkScrolledWindow" id="scroll_profile_shaders_results">
+                                        <property name="hscrollbar-policy">never</property>
+                                        <property name="min-content-height">220</property>
+                                        <property name="max-content-height">280</property>
+                                        <property name="vexpand">true</property>
+                                        <property name="child">
+                                          <object class="GtkFlowBox" id="flow_profile_shaders_results">
+                                            <property name="selection-mode">none</property>
+                                            <property name="column-spacing">10</property>
+                                            <property name="row-spacing">10</property>
+                                            <property name="max-children-per-line">1</property>
+                                            <property name="min-children-per-line">1</property>
+                                            <property name="activate-on-single-click">false</property>
+                                            <property name="valign">start</property>
+                                          </object>
+                                        </property>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </property>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkBox" id="profile_shaders_sheet_actions">
+                            <property name="orientation">horizontal</property>
+                            <property name="spacing">8</property>
+                            <property name="halign">end</property>
+                            <child>
+                              <object class="GtkButton" id="btn_profile_shaders_sheet_cancel">
+                                <property name="label">Close</property>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkButton" id="btn_profile_shaders_sheet_install">
+                                <property name="label">Install Selected</property>
+                                <style><class name="suggested-action"/></style>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                      </object>
+                    </property>
+                  </object>
+                </property>
+                <property name="sheet">
+                  <object class="GtkBox" id="sheet_mods_content">
+                    <property name="orientation">vertical</property>
+                    <property name="spacing">10</property>
+                    <property name="margin-start">20</property>
+                    <property name="margin-end">20</property>
+                    <property name="margin-top">16</property>
+                    <property name="margin-bottom">16</property>
+                    <child>
+                      <object class="GtkLabel" id="lbl_profile_mods_sheet_title">
+                        <property name="label">Manage Mods</property>
+                        <property name="halign">start</property>
+                        <style><class name="title-4"/></style>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkStackSwitcher" id="switcher_profile_mods_tabs">
+                        <property name="halign">start</property>
+                        <property name="stack">stack_profile_mods_tabs</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkStack" id="stack_profile_mods_tabs">
+                        <property name="transition-type">slide-left-right</property>
+                        <child>
+                          <object class="GtkStackPage">
+                            <property name="name">installed</property>
+                            <property name="title">Installed</property>
+                            <property name="child">
+                              <object class="GtkBox" id="box_profile_mods_installed_tab">
+                                <property name="orientation">vertical</property>
+                                <property name="spacing">8</property>
+                                <child>
+                                  <object class="GtkLabel" id="lbl_profile_mods_installed_status">
+                                    <property name="label">Installed mods for this profile</property>
+                                    <property name="halign">start</property>
+                                    <style><class name="dim-label"/></style>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkScrolledWindow" id="scroll_profile_mods_installed">
+                                    <property name="hscrollbar-policy">never</property>
+                                    <property name="min-content-height">220</property>
+                                    <property name="max-content-height">280</property>
+                                    <property name="vexpand">true</property>
+                                    <property name="child">
+                                      <object class="GtkFlowBox" id="flow_profile_mods_installed">
+                                        <property name="selection-mode">none</property>
+                                        <property name="column-spacing">8</property>
+                                        <property name="row-spacing">8</property>
+                                        <property name="max-children-per-line">1</property>
+                                        <property name="min-children-per-line">1</property>
+                                        <property name="activate-on-single-click">false</property>
+                                        <property name="valign">start</property>
+                                      </object>
+                                    </property>
+                                  </object>
+                                </child>
+                              </object>
+                            </property>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkStackPage">
+                            <property name="name">search</property>
+                            <property name="title">Search</property>
+                            <property name="child">
+                              <object class="GtkBox" id="box_profile_mods_search_tab">
+                                <property name="orientation">vertical</property>
+                                <property name="spacing">8</property>
+                                <child>
+                                  <object class="GtkBox" id="profile_mods_search_row">
+                                    <property name="orientation">horizontal</property>
+                                    <property name="spacing">8</property>
+                                    <child>
+                                      <object class="GtkEntry" id="entry_profile_mods_search">
+                                        <property name="hexpand">true</property>
+                                        <property name="placeholder-text">Search Modrinth mods</property>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="GtkButton" id="btn_profile_mods_search">
+                                        <property name="label">Search</property>
+                                        <style><class name="suggested-action"/></style>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkLabel" id="lbl_profile_mods_results_status">
+                                    <property name="label">Search mods for this profile</property>
+                                    <property name="halign">start</property>
+                                    <style><class name="dim-label"/></style>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkScrolledWindow" id="scroll_profile_mods_results">
+                                    <property name="hscrollbar-policy">never</property>
+                                    <property name="min-content-height">220</property>
+                                    <property name="max-content-height">280</property>
+                                    <property name="vexpand">true</property>
+                                    <property name="child">
+                                      <object class="GtkFlowBox" id="flow_profile_mods_results">
+                                        <property name="selection-mode">none</property>
+                                        <property name="column-spacing">10</property>
+                                        <property name="row-spacing">10</property>
+                                        <property name="max-children-per-line">1</property>
+                                        <property name="min-children-per-line">1</property>
+                                        <property name="activate-on-single-click">false</property>
+                                        <property name="valign">start</property>
+                                      </object>
+                                    </property>
+                                  </object>
+                                </child>
+                              </object>
+                            </property>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkBox" id="profile_mods_sheet_actions">
+                        <property name="orientation">horizontal</property>
+                        <property name="spacing">8</property>
+                        <property name="halign">end</property>
+                        <child>
+                          <object class="GtkButton" id="btn_profile_mods_sheet_cancel">
+                            <property name="label">Close</property>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkButton" id="btn_profile_mods_sheet_install">
+                            <property name="label">Install Selected</property>
+                            <style><class name="suggested-action"/></style>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                  </object>
+                </property>
+              </object>
+            </property>
+          </object>
+        </child>
+
+      </object>
+    </property>
+
+    <child type="bottom">
+      <object class="GtkCenterBox" id="bottom_deck">
+        <property name="margin-start">16</property>
+        <property name="margin-end">16</property>
+        <property name="margin-top">12</property>
+        <property name="margin-bottom">12</property>
+
+        <child type="start">
+          <object class="GtkBox" id="left_deck_section">
+            <property name="halign">start</property>
+            <property name="valign">center</property>
+            <child>
+              <object class="GtkDropDown" id="dropdown_profile_launch"/>
+            </child>
+          </object>
+        </child>
+
+        <child type="center">
+          <object class="GtkBox" id="center_deck_section">
+            <property name="orientation">vertical</property>
+            <property name="spacing">6</property>
+            <property name="halign">center</property>
+            <property name="valign">center</property>
+            <child>
+              <object class="GtkButton" id="btn_play">
+                <property name="label">Launch</property>
+                <property name="width-request">180</property>
+                <style>
+                  <class name="suggested-action"/>
+                  <class name="pill"/>
+                </style>
+              </object>
+            </child>
+            <child>
+              <object class="GtkProgressBar" id="progress_bar">
+                <property name="visible">false</property>
+                <property name="width-request">180</property>
+                <property name="valign">center</property>
+              </object>
+            </child>
+          </object>
+        </child>
+
+        <child type="end">
+          <object class="GtkBox" id="right_deck_section">
+            <property name="orientation">horizontal</property>
+            <property name="spacing">16</property>
+            <property name="halign">end</property>
+            <property name="valign">center</property>
+
+            <child>
+              <object class="GtkBox" id="greeting_text_layout">
+                <property name="orientation">vertical</property>
+                <property name="spacing">2</property>
+                <child>
+                  <object class="GtkLabel" id="lbl_welcome_user">
+                    <property name="halign">end</property>
+                    <style><class name="heading"/></style>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkLabel" id="lbl_ready_status">
+                    <property name="halign">end</property>
+                    <style><class name="dim-label"/></style>
+                  </object>
+                </child>
+              </object>
+            </child>
+
+            <child>
+              <object class="GtkButton" id="btn_switch_user">
+                <property name="label">Switch User</property>
+                <property name="valign">center</property>
+              </object>
+            </child>
+          </object>
+        </child>
+
+      </object>
+    </child>
+
+  </object>
+</interface>

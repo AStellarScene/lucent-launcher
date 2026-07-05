@@ -1,0 +1,26 @@
+[
+  {
+    "name": "Classic Vanilla",
+    "version_id": "26.2",
+    "loader": "Vanilla",
+    "loader_version": "LatestStable",
+    "color_mode": "Auto",
+    "color_hex": null
+  },
+  {
+    "name": "Fabric Modded",
+    "version_id": "26.1",
+    "loader": "Fabric",
+    "loader_version": "LatestStable",
+    "color_mode": "Auto",
+    "color_hex": null
+  },
+  {
+    "name": "Forge Modded",
+    "version_id": "1.21.4",
+    "loader": "Forge",
+    "loader_version": "LatestStable",
+    "color_mode": "Auto",
+    "color_hex": null
+  }
+]
