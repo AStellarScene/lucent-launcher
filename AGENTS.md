@@ -287,7 +287,7 @@ preparation completes.
 - `dropdown_profile_loader_version_mode` — loader version strategy
 - `row_profile_loader_version_exact` — exact loader version input
 - `btn_profile_create`, `btn_profile_save`, `btn_profile_delete`
-- `btn_profile_manage_mods`, `btn_profile_manage_shaders`
+- `btn_profile_manage_mods`, `btn_profile_manage_shaders`, `btn_profile_open_folder`
 - Runtime settings:
   - `dropdown_profile_runtime_java_policy` — Java install policy (`Auto`/`Never`)
   - `row_java_binary` — optional Java executable override

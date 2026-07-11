@@ -178,6 +178,14 @@
                                     <property name="width-request">220</property>
                                   </object>
                                 </child>
+                                <child type="suffix">
+                                  <object class="GtkButton" id="btn_profile_open_folder">
+                                    <property name="icon-name">folder-open-symbolic</property>
+                                    <property name="tooltip-text">Open this profile's folder in the file manager</property>
+                                    <property name="valign">center</property>
+                                    <style><class name="flat"/></style>
+                                  </object>
+                                </child>
                               </object>
                             </child>
                             <child>
@@ -372,13 +380,8 @@
                                         <property name="max-content-height">280</property>
                                         <property name="vexpand">true</property>
                                         <property name="child">
-                                          <object class="GtkFlowBox" id="flow_profile_shaders_installed">
-                                            <property name="selection-mode">none</property>
-                                            <property name="column-spacing">8</property>
-                                            <property name="row-spacing">8</property>
-                                            <property name="max-children-per-line">1</property>
-                                            <property name="min-children-per-line">1</property>
-                                            <property name="activate-on-single-click">false</property>
+                                          <object class="AdwPreferencesGroup" id="flow_profile_shaders_installed">
+                                            <property name="hexpand">true</property>
                                             <property name="valign">start</property>
                                           </object>
                                         </property>
@@ -428,13 +431,8 @@
                                         <property name="max-content-height">280</property>
                                         <property name="vexpand">true</property>
                                         <property name="child">
-                                          <object class="GtkFlowBox" id="flow_profile_shaders_results">
-                                            <property name="selection-mode">none</property>
-                                            <property name="column-spacing">10</property>
-                                            <property name="row-spacing">10</property>
-                                            <property name="max-children-per-line">1</property>
-                                            <property name="min-children-per-line">1</property>
-                                            <property name="activate-on-single-click">false</property>
+                                          <object class="AdwPreferencesGroup" id="flow_profile_shaders_results">
+                                            <property name="hexpand">true</property>
                                             <property name="valign">start</property>
                                           </object>
                                         </property>
@@ -514,13 +512,8 @@
                                     <property name="max-content-height">280</property>
                                     <property name="vexpand">true</property>
                                     <property name="child">
-                                      <object class="GtkFlowBox" id="flow_profile_mods_installed">
-                                        <property name="selection-mode">none</property>
-                                        <property name="column-spacing">8</property>
-                                        <property name="row-spacing">8</property>
-                                        <property name="max-children-per-line">1</property>
-                                        <property name="min-children-per-line">1</property>
-                                        <property name="activate-on-single-click">false</property>
+                                      <object class="AdwPreferencesGroup" id="flow_profile_mods_installed">
+                                        <property name="hexpand">true</property>
                                         <property name="valign">start</property>
                                       </object>
                                     </property>
@@ -570,13 +563,8 @@
                                     <property name="max-content-height">280</property>
                                     <property name="vexpand">true</property>
                                     <property name="child">
-                                      <object class="GtkFlowBox" id="flow_profile_mods_results">
-                                        <property name="selection-mode">none</property>
-                                        <property name="column-spacing">10</property>
-                                        <property name="row-spacing">10</property>
-                                        <property name="max-children-per-line">1</property>
-                                        <property name="min-children-per-line">1</property>
-                                        <property name="activate-on-single-click">false</property>
+                                      <object class="AdwPreferencesGroup" id="flow_profile_mods_results">
+                                        <property name="hexpand">true</property>
                                         <property name="valign">start</property>
                                       </object>
                                     </property>

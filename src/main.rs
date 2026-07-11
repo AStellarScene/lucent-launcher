@@ -1,8 +1,10 @@
 use adw::prelude::*;
-use adw::{ActionRow, Application, ApplicationWindow, BottomSheet, EntryRow, WrapBox};
+use adw::{
+    ActionRow, Application, ApplicationWindow, BottomSheet, EntryRow, PreferencesGroup, WrapBox,
+};
 use gtk::{
-    Box as GtkBox, Button, CheckButton, CssProvider, DropDown, Entry as GtkEntry, FlowBox, Frame,
-    GestureClick, Label, Orientation, ProgressBar, Stack, StringList, Switch, TextView,
+    Box as GtkBox, Button, CheckButton, CssProvider, DropDown, Entry as GtkEntry, GestureClick,
+    Label, Orientation, ProgressBar, Stack, StringList, Switch, TextView,
 };
 use keyring::{Entry, Error as KeyringError};
 use reqwest::blocking::Client;
@@ -570,70 +572,76 @@ fn apply_launch_profile_style(css_provider: &CssProvider, profile: Option<&Launc
 }
 
 #[allow(deprecated)]
-fn apply_glass_card_gradient(card: &Frame, profile: &LauncherProfile) {
+fn apply_profile_card_gradient(card: &Button, profile: &LauncherProfile) {
     let ((r1, g1, b1), (r2, g2, b2), (r3, g3, b3)) = profile_gradient_colors(profile);
-    let css = format!(
-        ".profile-glass-card {{
-            border-radius: 12px;
-            border: 1px solid alpha(@theme_fg_color, 0.15);
-            background-image:
-                linear-gradient(160deg,
-                    rgba({r1}, {g1}, {b1}, 0.44) 0%,
-                    rgba({r2}, {g2}, {b2}, 0.30) 52%,
-                    rgba({r3}, {g3}, {b3}, 0.22) 100%
+    let hover_1 = mix_rgb((r1, g1, b1), (255, 255, 255), 0.14);
+    let hover_2 = mix_rgb((r2, g2, b2), (255, 255, 255), 0.14);
+    let hover_3 = mix_rgb((r3, g3, b3), (255, 255, 255), 0.14);
+    let active_1 = mix_rgb((r1, g1, b1), (0, 0, 0), 0.14);
+    let active_2 = mix_rgb((r2, g2, b2), (0, 0, 0), 0.14);
+    let active_3 = mix_rgb((r3, g3, b3), (0, 0, 0), 0.14);
+
+    let gradient = |first: (u8, u8, u8), second: (u8, u8, u8), third: (u8, u8, u8), sheen: f32| {
+        format!(
+            "linear-gradient(160deg,
+                    rgba({}, {}, {}, 0.44) 0%,
+                    rgba({}, {}, {}, 0.30) 52%,
+                    rgba({}, {}, {}, 0.22) 100%
                 ),
                 linear-gradient(180deg,
-                    rgba(255, 255, 255, 0.18) 0%,
+                    rgba(255, 255, 255, {:.2}) 0%,
                     rgba(255, 255, 255, 0.00) 42%
-                );
-            box-shadow: 0 8px 22px rgba(0, 0, 0, 0.12);
-            transition: box-shadow 160ms ease, border-color 160ms ease, filter 160ms ease;
-        }}
-        .profile-glass-card:hover {{
-            border-color: alpha(@theme_fg_color, 0.24);
-            box-shadow: 0 12px 28px rgba(0, 0, 0, 0.18);
-            filter: brightness(1.04);
-        }}
-        .profile-glass-card > border {{
-            border-radius: 12px;
-        }}"
+                )",
+            first.0,
+            first.1,
+            first.2,
+            second.0,
+            second.1,
+            second.2,
+            third.0,
+            third.1,
+            third.2,
+            sheen
+        )
+    };
+
+    let base_gradient = gradient((r1, g1, b1), (r2, g2, b2), (r3, g3, b3), 0.18);
+    let hover_gradient = gradient(hover_1, hover_2, hover_3, 0.28);
+    let active_gradient = gradient(active_1, active_2, active_3, 0.10);
+    let css = format!(
+        ".profile-gradient-card {{
+                background-image: {base_gradient};
+            }}
+            .profile-gradient-card:hover {{
+                background-image: {hover_gradient};
+            }}
+            .profile-gradient-card.keyboard-activating,
+            .profile-gradient-card:active {{
+                background-image: {active_gradient};
+            }}"
     );
 
     let provider = CssProvider::new();
     provider.load_from_data(&css);
     card.style_context()
         .add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
-    card.add_css_class("profile-glass-card");
+    card.set_focusable(true);
+    card.add_css_class("profile-gradient-card");
+    card.add_css_class("card");
+    card.add_css_class("activatable");
 }
 
-#[allow(deprecated)]
-fn ensure_discovery_card_css(frame: &Frame) {
-    let css = ".discovery-card {
-            border-radius: 12px;
-            border: 1px solid alpha(@theme_fg_color, 0.18);
-            background: alpha(@theme_bg_color, 0.35);
-            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14);
-            transition: box-shadow 140ms ease, filter 140ms ease;
-        }
-        .discovery-card:hover {
-            box-shadow: 0 12px 28px rgba(0, 0, 0, 0.2);
-            filter: brightness(1.02);
-        }
-        .discovery-card > border {
-            border-radius: 12px;
-        }
-        .discovery-select-check check {
-            min-width: 18px;
-            min-height: 18px;
-            border-radius: 3px;
-        }";
+fn non_activatable_action_row(title: &str, subtitle: Option<&str>) -> ActionRow {
+    let builder = ActionRow::builder()
+        .title(title)
+        .activatable(false)
+        .selectable(false)
+        .focusable(false);
 
-    let provider = CssProvider::new();
-    provider.load_from_data(css);
-    frame
-        .style_context()
-        .add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
-    frame.add_css_class("discovery-card");
+    match subtitle {
+        Some(subtitle) => builder.subtitle(subtitle).build(),
+        None => builder.build(),
+    }
 }
 
 fn sanitize_component_for_path(input: &str) -> String {
@@ -2381,6 +2389,7 @@ fn build_ui(app: &Application) {
 
     let btn_profile_manage_mods: Button = builder.object("btn_profile_manage_mods").unwrap();
     let btn_profile_manage_shaders: Button = builder.object("btn_profile_manage_shaders").unwrap();
+    let btn_profile_open_folder: Button = builder.object("btn_profile_open_folder").unwrap();
 
     let sheet_profile_mods: BottomSheet = builder.object("sheet_profile_mods").unwrap();
     let entry_profile_mods_search: GtkEntry = builder.object("entry_profile_mods_search").unwrap();
@@ -2389,9 +2398,10 @@ fn build_ui(app: &Application) {
         builder.object("lbl_profile_mods_installed_status").unwrap();
     let lbl_profile_mods_results_status: Label =
         builder.object("lbl_profile_mods_results_status").unwrap();
-    let flow_profile_mods_installed: FlowBox =
+    let flow_profile_mods_installed: PreferencesGroup =
         builder.object("flow_profile_mods_installed").unwrap();
-    let flow_profile_mods_results: FlowBox = builder.object("flow_profile_mods_results").unwrap();
+    let flow_profile_mods_results: PreferencesGroup =
+        builder.object("flow_profile_mods_results").unwrap();
     let btn_profile_mods_sheet_cancel: Button =
         builder.object("btn_profile_mods_sheet_cancel").unwrap();
     let btn_profile_mods_sheet_install: Button =
@@ -2407,9 +2417,9 @@ fn build_ui(app: &Application) {
     let lbl_profile_shaders_results_status: Label = builder
         .object("lbl_profile_shaders_results_status")
         .unwrap();
-    let flow_profile_shaders_installed: FlowBox =
+    let flow_profile_shaders_installed: PreferencesGroup =
         builder.object("flow_profile_shaders_installed").unwrap();
-    let flow_profile_shaders_results: FlowBox =
+    let flow_profile_shaders_results: PreferencesGroup =
         builder.object("flow_profile_shaders_results").unwrap();
     let scroll_profile_shaders_installed: gtk::ScrolledWindow =
         builder.object("scroll_profile_shaders_installed").unwrap();
@@ -2468,6 +2478,7 @@ fn build_ui(app: &Application) {
 
     btn_profile_manage_mods.set_sensitive(false);
     btn_profile_manage_shaders.set_sensitive(false);
+    btn_profile_open_folder.set_sensitive(false);
 
     btn_profile_create.set_sensitive(false);
     btn_profile_save.set_sensitive(false);
@@ -2552,15 +2563,20 @@ fn build_ui(app: &Application) {
         Rc::new(RefCell::new(HashMap::new()));
     let selected_shader_projects: Rc<RefCell<HashMap<String, DiscoveryCardData>>> =
         Rc::new(RefCell::new(HashMap::new()));
+    let mods_results_rows: Rc<RefCell<Vec<ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let shaders_results_rows: Rc<RefCell<Vec<ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let mods_installed_rows: Rc<RefCell<Vec<ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let shaders_installed_rows: Rc<RefCell<Vec<ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
 
     let mods_results_render = mods_results.clone();
     let flow_mods_results_render = flow_profile_mods_results.clone();
     let selected_mod_projects_render = selected_mod_projects.clone();
+    let mods_results_rows_render = mods_results_rows.clone();
     let render_mods_cards_holder: RenderCallbackHolder = Rc::new(RefCell::new(None));
     let render_mods_cards_holder_for_init = render_mods_cards_holder.clone();
     let render_mods_cards: Rc<dyn Fn()> = Rc::new(move || {
-        while let Some(child) = flow_mods_results_render.first_child() {
-            flow_mods_results_render.remove(&child);
+        for row in mods_results_rows_render.borrow_mut().drain(..) {
+            flow_mods_results_render.remove(&row);
         }
 
         let mut selected_items: Vec<DiscoveryCardData> = selected_mod_projects_render
@@ -2571,44 +2587,16 @@ fn build_ui(app: &Application) {
         selected_items.sort_by_key(|item| item.title.to_lowercase());
 
         if !selected_items.is_empty() {
-            let selected_header = Label::new(Some("Selected for install"));
-            selected_header.set_xalign(0.0);
-            selected_header.add_css_class("heading");
-            flow_mods_results_render.insert(&selected_header, -1);
+            let selected_header = non_activatable_action_row("Selected for install", None);
+            flow_mods_results_render.add(&selected_header);
+            mods_results_rows_render.borrow_mut().push(selected_header);
 
             for item in selected_items {
-                let frame = Frame::new(None);
-                frame.set_hexpand(true);
-                frame.set_valign(gtk::Align::Start);
-                ensure_discovery_card_css(&frame);
-
-                let row = GtkBox::new(Orientation::Horizontal, 10);
-                row.set_margin_top(12);
-                row.set_margin_bottom(12);
-                row.set_margin_start(12);
-                row.set_margin_end(12);
-
+                let action_row = non_activatable_action_row(&item.title, Some(&item.description));
                 let check = CheckButton::new();
                 check.set_active(true);
-                check.set_size_request(22, 22);
                 check.set_valign(gtk::Align::Center);
-                check.add_css_class("discovery-select-check");
-
-                let text_col = GtkBox::new(Orientation::Vertical, 6);
-                text_col.set_hexpand(true);
-
-                let title = Label::new(Some(&item.title));
-                title.set_xalign(0.0);
-                title.set_wrap(false);
-                title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                title.add_css_class("heading");
-
-                let subtitle = Label::new(Some(&item.description));
-                subtitle.set_xalign(0.0);
-                subtitle.set_wrap(true);
-                subtitle.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-                subtitle.set_max_width_chars(56);
-                subtitle.add_css_class("dim-label");
+                action_row.add_suffix(&check);
 
                 let selected_mod_projects_toggle = selected_mod_projects_render.clone();
                 let render_mods_cards_toggle = render_mods_cards_holder_for_init.clone();
@@ -2624,13 +2612,8 @@ fn build_ui(app: &Application) {
                     }
                 });
 
-                text_col.append(&title);
-                text_col.append(&subtitle);
-                row.append(&check);
-                row.append(&text_col);
-                frame.set_child(Some(&row));
-
-                flow_mods_results_render.insert(&frame, -1);
+                flow_mods_results_render.add(&action_row);
+                mods_results_rows_render.borrow_mut().push(action_row);
             }
         }
 
@@ -2639,10 +2622,9 @@ fn build_ui(app: &Application) {
         } else {
             "Search results (unchecked items)"
         };
-        let header = Label::new(Some(search_results_header));
-        header.set_xalign(0.0);
-        header.add_css_class("dim-label");
-        flow_mods_results_render.insert(&header, -1);
+        let header = non_activatable_action_row(search_results_header, None);
+        flow_mods_results_render.add(&header);
+        mods_results_rows_render.borrow_mut().push(header);
 
         let selected_ids: HashSet<String> = selected_mod_projects_render
             .borrow()
@@ -2655,38 +2637,11 @@ fn build_ui(app: &Application) {
                 continue;
             }
 
-            let frame = Frame::new(None);
-            frame.set_hexpand(true);
-            frame.set_valign(gtk::Align::Start);
-            ensure_discovery_card_css(&frame);
-
-            let row = GtkBox::new(Orientation::Horizontal, 10);
-            row.set_margin_top(12);
-            row.set_margin_bottom(12);
-            row.set_margin_start(12);
-            row.set_margin_end(12);
-
+            let action_row = non_activatable_action_row(&item.title, Some(&item.description));
             let check = CheckButton::new();
             check.set_active(false);
-            check.set_size_request(22, 22);
             check.set_valign(gtk::Align::Center);
-            check.add_css_class("discovery-select-check");
-
-            let text_col = GtkBox::new(Orientation::Vertical, 6);
-            text_col.set_hexpand(true);
-
-            let title = Label::new(Some(&item.title));
-            title.set_xalign(0.0);
-            title.set_wrap(false);
-            title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            title.add_css_class("heading");
-
-            let subtitle = Label::new(Some(&item.description));
-            subtitle.set_xalign(0.0);
-            subtitle.set_wrap(true);
-            subtitle.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-            subtitle.set_max_width_chars(56);
-            subtitle.add_css_class("dim-label");
+            action_row.add_suffix(&check);
 
             let selected_mod_projects_toggle = selected_mod_projects_render.clone();
             let render_mods_cards_toggle = render_mods_cards_holder_for_init.clone();
@@ -2702,13 +2657,8 @@ fn build_ui(app: &Application) {
                 }
             });
 
-            text_col.append(&title);
-            text_col.append(&subtitle);
-            row.append(&check);
-            row.append(&text_col);
-            frame.set_child(Some(&row));
-
-            flow_mods_results_render.insert(&frame, -1);
+            flow_mods_results_render.add(&action_row);
+            mods_results_rows_render.borrow_mut().push(action_row);
         }
     });
     *render_mods_cards_holder.borrow_mut() = Some(render_mods_cards.clone());
@@ -2716,11 +2666,12 @@ fn build_ui(app: &Application) {
     let shaders_results_render = shaders_results.clone();
     let flow_shaders_results_render = flow_profile_shaders_results.clone();
     let selected_shader_projects_render = selected_shader_projects.clone();
+    let shaders_results_rows_render = shaders_results_rows.clone();
     let render_shaders_cards_holder: RenderCallbackHolder = Rc::new(RefCell::new(None));
     let render_shaders_cards_holder_for_init = render_shaders_cards_holder.clone();
     let render_shaders_cards: Rc<dyn Fn()> = Rc::new(move || {
-        while let Some(child) = flow_shaders_results_render.first_child() {
-            flow_shaders_results_render.remove(&child);
+        for row in shaders_results_rows_render.borrow_mut().drain(..) {
+            flow_shaders_results_render.remove(&row);
         }
 
         let mut selected_items: Vec<DiscoveryCardData> = selected_shader_projects_render
@@ -2731,44 +2682,18 @@ fn build_ui(app: &Application) {
         selected_items.sort_by_key(|item| item.title.to_lowercase());
 
         if !selected_items.is_empty() {
-            let selected_header = Label::new(Some("Selected for install"));
-            selected_header.set_xalign(0.0);
-            selected_header.add_css_class("heading");
-            flow_shaders_results_render.insert(&selected_header, -1);
+            let selected_header = non_activatable_action_row("Selected for install", None);
+            flow_shaders_results_render.add(&selected_header);
+            shaders_results_rows_render
+                .borrow_mut()
+                .push(selected_header);
 
             for item in selected_items {
-                let frame = Frame::new(None);
-                frame.set_hexpand(true);
-                frame.set_valign(gtk::Align::Start);
-                ensure_discovery_card_css(&frame);
-
-                let row = GtkBox::new(Orientation::Horizontal, 10);
-                row.set_margin_top(12);
-                row.set_margin_bottom(12);
-                row.set_margin_start(12);
-                row.set_margin_end(12);
-
+                let action_row = non_activatable_action_row(&item.title, Some(&item.description));
                 let check = CheckButton::new();
                 check.set_active(true);
-                check.set_size_request(22, 22);
                 check.set_valign(gtk::Align::Center);
-                check.add_css_class("discovery-select-check");
-
-                let text_col = GtkBox::new(Orientation::Vertical, 6);
-                text_col.set_hexpand(true);
-
-                let title = Label::new(Some(&item.title));
-                title.set_xalign(0.0);
-                title.set_wrap(false);
-                title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                title.add_css_class("heading");
-
-                let subtitle = Label::new(Some(&item.description));
-                subtitle.set_xalign(0.0);
-                subtitle.set_wrap(true);
-                subtitle.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-                subtitle.set_max_width_chars(56);
-                subtitle.add_css_class("dim-label");
+                action_row.add_suffix(&check);
 
                 let selected_shader_projects_toggle = selected_shader_projects_render.clone();
                 let render_shaders_cards_toggle = render_shaders_cards_holder_for_init.clone();
@@ -2784,13 +2709,8 @@ fn build_ui(app: &Application) {
                     }
                 });
 
-                text_col.append(&title);
-                text_col.append(&subtitle);
-                row.append(&check);
-                row.append(&text_col);
-                frame.set_child(Some(&row));
-
-                flow_shaders_results_render.insert(&frame, -1);
+                flow_shaders_results_render.add(&action_row);
+                shaders_results_rows_render.borrow_mut().push(action_row);
             }
         }
 
@@ -2799,10 +2719,9 @@ fn build_ui(app: &Application) {
         } else {
             "Search results (unchecked items)"
         };
-        let header = Label::new(Some(search_results_header));
-        header.set_xalign(0.0);
-        header.add_css_class("dim-label");
-        flow_shaders_results_render.insert(&header, -1);
+        let header = non_activatable_action_row(search_results_header, None);
+        flow_shaders_results_render.add(&header);
+        shaders_results_rows_render.borrow_mut().push(header);
 
         let selected_ids: HashSet<String> = selected_shader_projects_render
             .borrow()
@@ -2815,38 +2734,11 @@ fn build_ui(app: &Application) {
                 continue;
             }
 
-            let frame = Frame::new(None);
-            frame.set_hexpand(true);
-            frame.set_valign(gtk::Align::Start);
-            ensure_discovery_card_css(&frame);
-
-            let row = GtkBox::new(Orientation::Horizontal, 10);
-            row.set_margin_top(12);
-            row.set_margin_bottom(12);
-            row.set_margin_start(12);
-            row.set_margin_end(12);
-
+            let action_row = non_activatable_action_row(&item.title, Some(&item.description));
             let check = CheckButton::new();
             check.set_active(false);
-            check.set_size_request(22, 22);
             check.set_valign(gtk::Align::Center);
-            check.add_css_class("discovery-select-check");
-
-            let text_col = GtkBox::new(Orientation::Vertical, 6);
-            text_col.set_hexpand(true);
-
-            let title = Label::new(Some(&item.title));
-            title.set_xalign(0.0);
-            title.set_wrap(false);
-            title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-            title.add_css_class("heading");
-
-            let subtitle = Label::new(Some(&item.description));
-            subtitle.set_xalign(0.0);
-            subtitle.set_wrap(true);
-            subtitle.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-            subtitle.set_max_width_chars(56);
-            subtitle.add_css_class("dim-label");
+            action_row.add_suffix(&check);
 
             let selected_shader_projects_toggle = selected_shader_projects_render.clone();
             let render_shaders_cards_toggle = render_shaders_cards_holder_for_init.clone();
@@ -2862,13 +2754,8 @@ fn build_ui(app: &Application) {
                 }
             });
 
-            text_col.append(&title);
-            text_col.append(&subtitle);
-            row.append(&check);
-            row.append(&text_col);
-            frame.set_child(Some(&row));
-
-            flow_shaders_results_render.insert(&frame, -1);
+            flow_shaders_results_render.add(&action_row);
+            shaders_results_rows_render.borrow_mut().push(action_row);
         }
     });
     *render_shaders_cards_holder.borrow_mut() = Some(render_shaders_cards.clone());
@@ -2877,10 +2764,11 @@ fn build_ui(app: &Application) {
     let flow_mods_installed_render = flow_profile_mods_installed.clone();
     let profiles_for_mods_installed_render = profiles.clone();
     let profile_editor_for_mods_installed_render = dropdown_profile_editor.clone();
+    let mods_installed_rows_render = mods_installed_rows.clone();
     let tx_mods_installed_render = tx.clone();
     let render_mods_installed_cards: Rc<dyn Fn()> = Rc::new(move || {
-        while let Some(child) = flow_mods_installed_render.first_child() {
-            flow_mods_installed_render.remove(&child);
+        for row in mods_installed_rows_render.borrow_mut().drain(..) {
+            flow_mods_installed_render.remove(&row);
         }
 
         let profile_idx = profile_editor_for_mods_installed_render.selected() as usize;
@@ -2890,22 +2778,7 @@ fn build_ui(app: &Application) {
             .cloned();
 
         for item in mods_installed_render.borrow().iter() {
-            let frame = Frame::new(None);
-            frame.set_hexpand(true);
-            frame.set_valign(gtk::Align::Start);
-            ensure_discovery_card_css(&frame);
-
-            let row = GtkBox::new(Orientation::Horizontal, 10);
-            row.set_margin_top(10);
-            row.set_margin_bottom(10);
-            row.set_margin_start(10);
-            row.set_margin_end(10);
-
-            let name = Label::new(Some(&item.display_name));
-            name.set_xalign(0.0);
-            name.set_hexpand(true);
-            name.set_wrap(false);
-            name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            let action_row = non_activatable_action_row(&item.display_name, None);
 
             let state = Switch::new();
             state.set_active(item.enabled);
@@ -2958,11 +2831,10 @@ fn build_ui(app: &Application) {
                 del.set_sensitive(false);
             }
 
-            row.append(&name);
-            row.append(&state);
-            row.append(&del);
-            frame.set_child(Some(&row));
-            flow_mods_installed_render.insert(&frame, -1);
+            action_row.add_suffix(&state);
+            action_row.add_suffix(&del);
+            flow_mods_installed_render.add(&action_row);
+            mods_installed_rows_render.borrow_mut().push(action_row);
         }
     });
 
@@ -2970,10 +2842,11 @@ fn build_ui(app: &Application) {
     let flow_shaders_installed_render = flow_profile_shaders_installed.clone();
     let profiles_for_shaders_installed_render = profiles.clone();
     let profile_editor_for_shaders_installed_render = dropdown_profile_editor.clone();
+    let shaders_installed_rows_render = shaders_installed_rows.clone();
     let tx_shaders_installed_render = tx.clone();
     let render_shaders_installed_cards: Rc<dyn Fn()> = Rc::new(move || {
-        while let Some(child) = flow_shaders_installed_render.first_child() {
-            flow_shaders_installed_render.remove(&child);
+        for row in shaders_installed_rows_render.borrow_mut().drain(..) {
+            flow_shaders_installed_render.remove(&row);
         }
 
         let profile_idx = profile_editor_for_shaders_installed_render.selected() as usize;
@@ -2983,22 +2856,7 @@ fn build_ui(app: &Application) {
             .cloned();
 
         for item in shaders_installed_render.borrow().iter() {
-            let frame = Frame::new(None);
-            frame.set_hexpand(true);
-            frame.set_valign(gtk::Align::Start);
-            ensure_discovery_card_css(&frame);
-
-            let row = GtkBox::new(Orientation::Horizontal, 10);
-            row.set_margin_top(10);
-            row.set_margin_bottom(10);
-            row.set_margin_start(10);
-            row.set_margin_end(10);
-
-            let name = Label::new(Some(&item.display_name));
-            name.set_xalign(0.0);
-            name.set_hexpand(true);
-            name.set_wrap(false);
-            name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            let action_row = non_activatable_action_row(&item.display_name, None);
 
             let state = Switch::new();
             state.set_active(item.enabled);
@@ -3057,11 +2915,10 @@ fn build_ui(app: &Application) {
                 del.set_sensitive(false);
             }
 
-            row.append(&name);
-            row.append(&state);
-            row.append(&del);
-            frame.set_child(Some(&row));
-            flow_shaders_installed_render.insert(&frame, -1);
+            action_row.add_suffix(&state);
+            action_row.add_suffix(&del);
+            flow_shaders_installed_render.add(&action_row);
+            shaders_installed_rows_render.borrow_mut().push(action_row);
         }
     });
 
@@ -3081,10 +2938,11 @@ fn build_ui(app: &Application) {
         let profile_list = profiles_for_home_cards.borrow();
 
         for (idx, profile) in profile_list.iter().enumerate() {
-            let card_frame = Frame::new(None);
+            let card_frame = Button::new();
+            card_frame.set_focusable(true);
             card_frame.set_size_request(250, 132);
             card_frame.set_valign(gtk::Align::Start);
-            apply_glass_card_gradient(&card_frame, profile);
+            apply_profile_card_gradient(&card_frame, profile);
 
             let card_root = GtkBox::new(Orientation::Vertical, 8);
             card_root.set_margin_top(10);
@@ -3214,6 +3072,7 @@ fn build_ui(app: &Application) {
     let editor_dropdown_refresh = dropdown_profile_editor.clone();
     let btn_profile_manage_mods_refresh = btn_profile_manage_mods.clone();
     let btn_profile_manage_shaders_refresh = btn_profile_manage_shaders.clone();
+    let btn_profile_open_folder_refresh = btn_profile_open_folder.clone();
     let version_dropdown_refresh = dropdown_profile_version.clone();
     let loader_dropdown_refresh = dropdown_profile_loader.clone();
     let loader_version_mode_dropdown_refresh = dropdown_profile_loader_version_mode.clone();
@@ -3251,6 +3110,7 @@ fn build_ui(app: &Application) {
 
                 btn_profile_manage_mods_refresh.set_sensitive(false);
                 btn_profile_manage_shaders_refresh.set_sensitive(false);
+                btn_profile_open_folder_refresh.set_sensitive(false);
 
                 version_dropdown_refresh.set_sensitive(false);
                 loader_dropdown_refresh.set_sensitive(false);
@@ -3370,6 +3230,7 @@ fn build_ui(app: &Application) {
 
             btn_profile_manage_mods_refresh.set_sensitive(true);
             btn_profile_manage_shaders_refresh.set_sensitive(true);
+            btn_profile_open_folder_refresh.set_sensitive(true);
             btn_profile_create_refresh.set_sensitive(!version_list.is_empty());
             btn_profile_save_refresh.set_sensitive(true);
             btn_profile_delete_refresh.set_sensitive(profile_list.len() > 1);
@@ -3999,6 +3860,42 @@ fn build_ui(app: &Application) {
         (render_home_cards_switch)();
     });
 
+    let profiles_open_folder = profiles.clone();
+    let dropdown_profile_editor_open_folder = dropdown_profile_editor.clone();
+    let lbl_status_open_folder = lbl_ready_status.clone();
+    let text_view_open_folder = text_view.clone();
+    btn_profile_open_folder.connect_clicked(move |_| {
+        let profile_idx = dropdown_profile_editor_open_folder.selected() as usize;
+        let Some(profile) = profiles_open_folder.borrow().get(profile_idx).cloned() else {
+            lbl_status_open_folder.set_label("Select a profile first");
+            return;
+        };
+
+        let directory = match profile_game_directory(&profile) {
+            Ok(directory) => directory,
+            Err(error) => {
+                lbl_status_open_folder.set_label("Profile folder unavailable");
+                text_view_open_folder.buffer().insert_at_cursor(&format!(
+                    "[ERROR] Failed resolving profile folder: {error}\n"
+                ));
+                return;
+            }
+        };
+        let uri = gtk::gio::File::for_path(&directory).uri();
+        if let Err(error) = gtk::gio::AppInfo::launch_default_for_uri(
+            uri.as_str(),
+            None::<&gtk::gio::AppLaunchContext>,
+        ) {
+            lbl_status_open_folder.set_label("Failed to open profile folder");
+            text_view_open_folder.buffer().insert_at_cursor(&format!(
+                "[ERROR] Failed opening profile folder '{}': {error}\n",
+                directory.display()
+            ));
+        } else {
+            lbl_status_open_folder.set_label("Profile folder opened");
+        }
+    });
+
     // Mods/Shaders in profile editor bottom sheets.
     let sheet_profile_mods_open = sheet_profile_mods.clone();
     let mods_results_clear_on_open = mods_results.clone();
@@ -4431,7 +4328,7 @@ fn build_ui(app: &Application) {
                         lbl_progress_clone.set_label("Game Running");
                         lbl_progress_clone.set_visible(true);
                     } else if !another_launch_pending {
-                        lbl_status_clone.set_label("Game Closed / Task Completed");
+                        lbl_status_clone.set_label("Game Closed");
                         progress_bar_clone.set_visible(false);
                         progress_bar_clone.set_fraction(0.0);
                         lbl_progress_clone.set_label("");
@@ -4451,7 +4348,7 @@ fn build_ui(app: &Application) {
                     lbl_status_clone.set_label(if another_game_running {
                         "Game Running"
                     } else {
-                        "Execution Error!"
+                        "Execution Error"
                     });
                     buffer.insert_at_cursor(&format!("[ERROR] {error}\n"));
                     let mut end = buffer.end_iter();
@@ -4517,7 +4414,7 @@ fn build_ui(app: &Application) {
                     match kind {
                         DiscoveryKind::Mods => {
                             lbl_mods_results_status_poll
-                                .set_label("Modrinth search failed for mods");
+                                .set_label("Modrinth search failed for mod");
                         }
                         DiscoveryKind::Shaders => {
                             lbl_shaders_results_status_poll
@@ -4609,7 +4506,7 @@ fn build_ui(app: &Application) {
 
         task_active_launch.set(true);
         progress_bar_launch.set_fraction(0.0);
-        lbl_progress_launch.set_label("Preparing launch…");
+        lbl_progress_launch.set_label("Preparing...");
         lbl_progress_launch.set_visible(true);
         progress_bar_launch.set_visible(true);
 
