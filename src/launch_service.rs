@@ -1,16 +1,18 @@
 //! GTK-free launch orchestration.
 
 use std::{
+    collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader},
     path::Path,
-    process::Stdio,
+    process::{Child, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
     thread,
+    time::Duration,
 };
 
 use crate::messages::{AppEvent, LaunchEvent, LaunchProgress};
@@ -91,6 +93,7 @@ fn core_progress_reporter(
     use mc_launcher_core::progress::ProgressEvent;
 
     let mut stage = "Preparing installation".to_string();
+    let mut plan_stage = stage.clone();
     let mut completed_tasks = 0_u64;
     let mut total_tasks = None;
     let mut current_task = None;
@@ -101,6 +104,7 @@ fn core_progress_reporter(
         match event {
             ProgressEvent::StageStarted { stage: next_stage } => {
                 stage = install_stage_label(&next_stage).to_string();
+                plan_stage = stage.clone();
                 completed_tasks = 0;
                 total_tasks = None;
                 bytes_received = 0;
@@ -114,12 +118,14 @@ fn core_progress_reporter(
                 total_bytes = None;
             }
             ProgressEvent::TaskStarted { label, .. } => {
+                stage = plan_stage.clone();
                 current_task = Some(label);
                 bytes_received = 0;
                 total_bytes = None;
             }
             ProgressEvent::TaskSkipped { label, .. } => {
                 completed_tasks = completed_tasks.saturating_add(1);
+                stage = "Using cached files".to_string();
                 current_task = Some(label);
                 bytes_received = 0;
                 total_bytes = None;
@@ -198,6 +204,9 @@ fn forward_process_line(
 /// Owns the blocking preparation and execution pipeline for one profile.
 pub(crate) struct LaunchService;
 
+pub(crate) type ProcessRegistry = Arc<Mutex<HashMap<String, Arc<Mutex<Child>>>>>;
+pub(crate) type StopRegistry = Arc<Mutex<HashSet<String>>>;
+
 impl LaunchService {
     /// Installs/prepares the selected profile and waits for the Java process.
     ///
@@ -209,6 +218,8 @@ impl LaunchService {
         java_path_raw: String,
         java_install_policy: mc_launcher_core::install::JavaInstallPolicy,
         thread_tx: mpsc::Sender<AppEvent>,
+        process_registry: ProcessRegistry,
+        stop_registry: StopRegistry,
     ) {
         use mc_launcher_core::account::Account;
         use mc_launcher_core::prelude::*;
@@ -666,66 +677,110 @@ impl LaunchService {
                         }
 
                         match child_res {
-                            Ok(mut child) => {
+                            Ok(child) => {
+                                let profile_id = selected_profile.id.clone();
+                                let child = Arc::new(Mutex::new(child));
+                                if let Ok(mut processes) = process_registry.lock() {
+                                    processes.insert(profile_id.clone(), Arc::clone(&child));
+                                }
+                                if stop_registry
+                                    .lock()
+                                    .map(|stops| stops.contains(&profile_id))
+                                    .unwrap_or(false)
+                                    && let Ok(mut child_process) = child.lock()
+                                {
+                                    let _ = child_process.kill();
+                                }
+
                                 let _ = thread_tx.send(AppEvent::StatusUpdate(
                                     "Waiting for Minecraft to initialize…".into(),
                                 ));
                                 let game_ready = Arc::new(AtomicBool::new(false));
-                                let profile_id = selected_profile.id.clone();
 
                                 let stdout_tx = thread_tx.clone();
                                 let stdout_ready = Arc::clone(&game_ready);
                                 let stdout_profile_id = profile_id.clone();
-                                let stdout_reader = child.stdout.take().map(|stdout| {
-                                    thread::spawn(move || {
-                                        let reader = BufReader::new(stdout);
-                                        for line in reader.lines() {
-                                            match line {
-                                                Ok(line) => forward_process_line(
-                                                    &stdout_tx,
-                                                    line,
-                                                    None,
-                                                    &stdout_ready,
-                                                    &stdout_profile_id,
-                                                ),
-                                                Err(e) => {
-                                                    let _ = stdout_tx.send(AppEvent::Log(format!(
-                                                        "[stdout read error] {e}"
-                                                    )));
-                                                    break;
+                                let stdout_reader = child
+                                    .lock()
+                                    .ok()
+                                    .and_then(|mut child_process| child_process.stdout.take())
+                                    .map(|stdout| {
+                                        thread::spawn(move || {
+                                            let reader = BufReader::new(stdout);
+                                            for line in reader.lines() {
+                                                match line {
+                                                    Ok(line) => forward_process_line(
+                                                        &stdout_tx,
+                                                        line,
+                                                        None,
+                                                        &stdout_ready,
+                                                        &stdout_profile_id,
+                                                    ),
+                                                    Err(e) => {
+                                                        let _ = stdout_tx.send(AppEvent::Log(
+                                                            format!("[stdout read error] {e}"),
+                                                        ));
+                                                        break;
+                                                    }
                                                 }
                                             }
-                                        }
-                                    })
-                                });
+                                        })
+                                    });
 
                                 let stderr_tx = thread_tx.clone();
                                 let stderr_ready = Arc::clone(&game_ready);
                                 let stderr_profile_id = profile_id.clone();
-                                let stderr_reader = child.stderr.take().map(|stderr| {
-                                    thread::spawn(move || {
-                                        let reader = BufReader::new(stderr);
-                                        for line in reader.lines() {
-                                            match line {
-                                                Ok(line) => forward_process_line(
-                                                    &stderr_tx,
-                                                    line,
-                                                    Some("[stderr] "),
-                                                    &stderr_ready,
-                                                    &stderr_profile_id,
-                                                ),
-                                                Err(e) => {
-                                                    let _ = stderr_tx.send(AppEvent::Log(format!(
-                                                        "[stderr read error] {e}"
-                                                    )));
-                                                    break;
+                                let stderr_reader = child
+                                    .lock()
+                                    .ok()
+                                    .and_then(|mut child_process| child_process.stderr.take())
+                                    .map(|stderr| {
+                                        thread::spawn(move || {
+                                            let reader = BufReader::new(stderr);
+                                            for line in reader.lines() {
+                                                match line {
+                                                    Ok(line) => forward_process_line(
+                                                        &stderr_tx,
+                                                        line,
+                                                        Some("[stderr] "),
+                                                        &stderr_ready,
+                                                        &stderr_profile_id,
+                                                    ),
+                                                    Err(e) => {
+                                                        let _ = stderr_tx.send(AppEvent::Log(
+                                                            format!("[stderr read error] {e}"),
+                                                        ));
+                                                        break;
+                                                    }
                                                 }
                                             }
-                                        }
-                                    })
-                                });
+                                        })
+                                    });
 
-                                match child.wait() {
+                                let wait_result = loop {
+                                    let poll_result = child
+                                        .lock()
+                                        .map_err(|error| {
+                                            io::Error::other(format!(
+                                                "failed locking Java process: {error}"
+                                            ))
+                                        })
+                                        .and_then(|mut child_process| child_process.try_wait());
+                                    match poll_result {
+                                        Ok(Some(status)) => break Ok(status),
+                                        Ok(None) => thread::sleep(Duration::from_millis(100)),
+                                        Err(error) => break Err(error),
+                                    }
+                                };
+                                let stopped = stop_registry
+                                    .lock()
+                                    .map(|mut stops| stops.remove(&profile_id))
+                                    .unwrap_or(false);
+                                if let Ok(mut processes) = process_registry.lock() {
+                                    processes.remove(&profile_id);
+                                }
+
+                                match wait_result {
                                     Ok(status) => {
                                         if let Some(handle) = stdout_reader {
                                             let _ = handle.join();
@@ -734,7 +789,7 @@ impl LaunchService {
                                             let _ = handle.join();
                                         }
 
-                                        if status.success() {
+                                        if status.success() || stopped {
                                             let _ = thread_tx.send(AppEvent::launch_finished(
                                                 profile_id.clone(),
                                             ));

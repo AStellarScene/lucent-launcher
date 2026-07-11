@@ -1,6 +1,7 @@
 use adw::prelude::*;
 use adw::{
-    ActionRow, Application, ApplicationWindow, BottomSheet, EntryRow, PreferencesGroup, WrapBox,
+    ActionRow, Application, ApplicationWindow, Bin, BottomSheet, EntryRow, PreferencesGroup,
+    Spinner, WrapBox,
 };
 use gtk::{
     Box as GtkBox, Button, CheckButton, CssProvider, DropDown, Entry as GtkEntry, GestureClick,
@@ -19,7 +20,7 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::rc::Rc;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -109,6 +110,14 @@ struct LauncherProfile {
 
 fn default_java_auto_download() -> bool {
     true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum HomeCardLaunchState {
+    #[default]
+    Idle,
+    Preparing,
+    Running,
 }
 
 impl LauncherProfile {
@@ -572,7 +581,7 @@ fn apply_launch_profile_style(css_provider: &CssProvider, profile: Option<&Launc
 }
 
 #[allow(deprecated)]
-fn apply_profile_card_gradient(card: &Button, profile: &LauncherProfile) {
+fn apply_profile_card_gradient(card: &impl IsA<gtk::Widget>, profile: &LauncherProfile) {
     let ((r1, g1, b1), (r2, g2, b2), (r3, g3, b3)) = profile_gradient_colors(profile);
     let hover_1 = mix_rgb((r1, g1, b1), (255, 255, 255), 0.14);
     let hover_2 = mix_rgb((r2, g2, b2), (255, 255, 255), 0.14);
@@ -631,6 +640,21 @@ fn apply_profile_card_gradient(card: &Button, profile: &LauncherProfile) {
     card.add_css_class("activatable");
 }
 
+#[allow(deprecated)]
+fn configure_home_card_spinner(spinner: &Spinner) {
+    spinner.set_width_request(20);
+    spinner.set_height_request(20);
+    spinner.set_halign(gtk::Align::Center);
+    spinner.set_valign(gtk::Align::Center);
+    spinner.add_css_class("home-card-spinner");
+
+    let provider = CssProvider::new();
+    provider.load_from_data(".home-card-spinner { color: #000000; }");
+    spinner
+        .style_context()
+        .add_provider(&provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+}
+
 fn non_activatable_action_row(title: &str, subtitle: Option<&str>) -> ActionRow {
     let builder = ActionRow::builder()
         .title(title)
@@ -660,6 +684,14 @@ fn sanitize_component_for_path(input: &str) -> String {
 fn write_runtime_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     mc_launcher_core::io::atomic::write_bytes(path, bytes)
         .map_err(|e| format!("failed writing '{}': {e}", path.display()))
+}
+
+fn runtime_file_matches_sha1(path: &Path, expected_sha1: &str) -> Result<bool, String> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+
+    Ok(sha1_file_hex(path)?.eq_ignore_ascii_case(expected_sha1))
 }
 
 fn profile_game_directory(profile: &LauncherProfile) -> Result<PathBuf, String> {
@@ -1473,7 +1505,7 @@ fn ensure_runtime_java_for_version(
     }
 
     let _ = tx.send(AppEvent::Log(format!(
-        "No managed Java runtime found for '{}'; downloading runtime component '{}'...",
+        "No managed Java runtime found for '{}'; checking/installing runtime component '{}'...",
         version_id, runtime_component
     )));
 
@@ -1493,7 +1525,7 @@ fn ensure_runtime_java_for_version(
         mc_launcher_core::runtime::get_executable_path(&runtime_component, minecraft_dir)
     {
         let _ = tx.send(AppEvent::Log(format!(
-            "Installed managed Java runtime '{}' at {}",
+            "Resolved managed Java runtime '{}' at {}",
             runtime_component,
             executable.display()
         )));
@@ -1616,24 +1648,30 @@ fn install_jvm_runtime_raw_files(jvm_component: &str, minecraft_dir: &Path) -> R
                     )
                 })?;
 
-                let bytes = client
-                    .get(&downloads.raw.url)
-                    .send()
-                    .map_err(|e| format!("failed downloading runtime file '{}': {e}", rel_path))?
-                    .error_for_status()
-                    .map_err(|e| format!("failed downloading runtime file '{}': {e}", rel_path))?
-                    .bytes()
-                    .map_err(|e| format!("failed reading runtime file '{}': {e}", rel_path))?;
+                if !runtime_file_matches_sha1(&destination, &downloads.raw.sha1)? {
+                    let bytes = client
+                        .get(&downloads.raw.url)
+                        .send()
+                        .map_err(|e| {
+                            format!("failed downloading runtime file '{}': {e}", rel_path)
+                        })?
+                        .error_for_status()
+                        .map_err(|e| {
+                            format!("failed downloading runtime file '{}': {e}", rel_path)
+                        })?
+                        .bytes()
+                        .map_err(|e| format!("failed reading runtime file '{}': {e}", rel_path))?;
 
-                let hash = format!("{:x}", Sha1::digest(&bytes));
-                if !hash.eq_ignore_ascii_case(&downloads.raw.sha1) {
-                    return Err(format!(
-                        "sha1 mismatch for runtime file '{}': expected {}, got {}",
-                        rel_path, downloads.raw.sha1, hash
-                    ));
+                    let hash = format!("{:x}", Sha1::digest(&bytes));
+                    if !hash.eq_ignore_ascii_case(&downloads.raw.sha1) {
+                        return Err(format!(
+                            "sha1 mismatch for runtime file '{}': expected {}, got {}",
+                            rel_path, downloads.raw.sha1, hash
+                        ));
+                    }
+
+                    write_runtime_file(&destination, &bytes)?;
                 }
-
-                write_runtime_file(&destination, &bytes)?;
 
                 #[cfg(unix)]
                 {
@@ -1714,6 +1752,22 @@ fn install_forge_profile_with_java(
     let _ = tx.send(AppEvent::Log(
         "Ensured launcher_profiles.json exists for Forge installer compatibility".to_string(),
     ));
+
+    let installed_version_id =
+        mc_launcher_core::loader::forge::forge_installed_version_id(forge_version)
+            .map_err(|e| format!("failed resolving installed Forge version id: {e}"))?;
+    let installed_version_json = launcher
+        .minecraft_dir()
+        .join("versions")
+        .join(&installed_version_id)
+        .join(format!("{installed_version_id}.json"));
+    if installed_version_json.is_file() {
+        let _ = tx.send(AppEvent::Log(format!(
+            "Using existing Forge installation '{}'",
+            installed_version_id
+        )));
+        return Ok(installed_version_id);
+    }
 
     let installer_url = mc_launcher_core::loader::forge::installer_url(forge_version);
     let installer_dir = launcher.minecraft_dir().join("installers");
@@ -1863,8 +1917,7 @@ fn install_forge_profile_with_java(
         ));
     }
 
-    mc_launcher_core::loader::forge::forge_installed_version_id(forge_version)
-        .map_err(|e| format!("failed resolving installed Forge version id: {e}"))
+    Ok(installed_version_id)
 }
 
 fn ensure_maven_fallback_libraries_present(
@@ -2922,7 +2975,15 @@ fn build_ui(app: &Application) {
         }
     });
 
+    let home_card_launch_states: Rc<RefCell<HashMap<String, HomeCardLaunchState>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+    let process_registry: launch_service::ProcessRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let stop_registry: launch_service::StopRegistry = Arc::new(Mutex::new(HashSet::new()));
+
     let profiles_for_home_cards = profiles.clone();
+    let home_card_launch_states_for_render = home_card_launch_states.clone();
+    let process_registry_for_cards = Arc::clone(&process_registry);
+    let stop_registry_for_cards = Arc::clone(&stop_registry);
     let current_session_for_home_cards = current_session.clone();
     let flow_home_profiles_render = flow_home_profiles.clone();
     let dropdown_profile_launch_for_cards = dropdown_profile_launch.clone();
@@ -2938,7 +2999,7 @@ fn build_ui(app: &Application) {
         let profile_list = profiles_for_home_cards.borrow();
 
         for (idx, profile) in profile_list.iter().enumerate() {
-            let card_frame = Button::new();
+            let card_frame = Bin::new();
             card_frame.set_focusable(true);
             card_frame.set_size_request(250, 132);
             card_frame.set_valign(gtk::Align::Start);
@@ -2978,19 +3039,81 @@ fn build_ui(app: &Application) {
             let spacer = GtkBox::new(Orientation::Horizontal, 0);
             spacer.set_hexpand(true);
 
-            let btn_card_play = Button::builder()
-                .icon_name("media-playback-start-symbolic")
-                .build();
+            let profile_id = profile.id.clone();
+            let card_state = home_card_launch_states_for_render
+                .borrow()
+                .get(&profile_id)
+                .copied()
+                .unwrap_or_default();
+            let btn_card_play = Button::new();
             btn_card_play.add_css_class("flat");
             btn_card_play.add_css_class("circular");
-            btn_card_play.set_tooltip_text(Some("Launch profile"));
             btn_card_play.set_halign(gtk::Align::End);
             btn_card_play.set_valign(gtk::Align::End);
-            btn_card_play.set_sensitive(signed_in);
+            btn_card_play.set_sensitive(signed_in && card_state != HomeCardLaunchState::Preparing);
+
+            match card_state {
+                HomeCardLaunchState::Preparing => {
+                    let spinner = Spinner::new();
+                    configure_home_card_spinner(&spinner);
+                    btn_card_play.set_child(Some(&spinner));
+                    btn_card_play.set_tooltip_text(Some("Preparing game…"));
+                }
+                HomeCardLaunchState::Running => {
+                    btn_card_play.set_icon_name("media-playback-stop-symbolic");
+                    btn_card_play.set_tooltip_text(Some("Stop game"));
+                }
+                HomeCardLaunchState::Idle => {
+                    btn_card_play.set_icon_name("media-playback-start-symbolic");
+                    btn_card_play.set_tooltip_text(Some("Launch profile"));
+                }
+            }
 
             let launch_dropdown = dropdown_profile_launch_for_cards.clone();
             let launch_btn = btn_play_for_cards.clone();
-            btn_card_play.connect_clicked(move |_| {
+            let home_card_launch_states_for_click = home_card_launch_states_for_render.clone();
+            let process_registry_for_click = process_registry_for_cards.clone();
+            let stop_registry_for_click = stop_registry_for_cards.clone();
+            btn_card_play.connect_clicked(move |button| {
+                let current_state = home_card_launch_states_for_click
+                    .borrow()
+                    .get(&profile_id)
+                    .copied()
+                    .unwrap_or_default();
+
+                if current_state == HomeCardLaunchState::Preparing {
+                    return;
+                }
+
+                if current_state == HomeCardLaunchState::Running {
+                    if let Ok(mut stops) = stop_registry_for_click.lock() {
+                        stops.insert(profile_id.clone());
+                    }
+                    let process = process_registry_for_click
+                        .lock()
+                        .ok()
+                        .and_then(|processes| processes.get(&profile_id).cloned());
+                    if let Some(process) = process
+                        && let Ok(mut child) = process.lock()
+                    {
+                        let _ = child.kill();
+                    }
+                    button.set_sensitive(false);
+                    return;
+                }
+
+                if !launch_btn.is_sensitive() {
+                    return;
+                }
+
+                home_card_launch_states_for_click
+                    .borrow_mut()
+                    .insert(profile_id.clone(), HomeCardLaunchState::Preparing);
+                let spinner = Spinner::new();
+                configure_home_card_spinner(&spinner);
+                button.set_child(Some(&spinner));
+                button.set_tooltip_text(Some("Preparing game…"));
+                button.set_sensitive(false);
                 launch_dropdown.set_selected(idx as u32);
                 launch_btn.emit_clicked();
             });
@@ -4188,6 +4311,7 @@ fn build_ui(app: &Application) {
     let game_running_poll = game_running.clone();
     let pending_launches_poll = pending_launches.clone();
     let running_profile_ids_poll = running_profile_ids.clone();
+    let home_card_launch_states_poll = home_card_launch_states.clone();
     let render_home_cards_poll = render_home_cards.clone();
     let mods_results_poll = mods_results.clone();
     let shaders_results_poll = shaders_results.clone();
@@ -4299,7 +4423,13 @@ fn build_ui(app: &Application) {
                 }
                 AppEvent::Launch(LaunchEvent::Ready { profile_id }) => {
                     pending_launches_poll.borrow_mut().remove(&profile_id);
-                    running_profile_ids_poll.borrow_mut().insert(profile_id);
+                    running_profile_ids_poll
+                        .borrow_mut()
+                        .insert(profile_id.clone());
+                    home_card_launch_states_poll
+                        .borrow_mut()
+                        .insert(profile_id, HomeCardLaunchState::Running);
+                    (render_home_cards_poll)();
                     game_running_poll.set(true);
                     task_active_poll.set(!pending_launches_poll.borrow().is_empty());
                     progress_bar_clone.set_fraction(1.0);
@@ -4314,6 +4444,10 @@ fn build_ui(app: &Application) {
                 AppEvent::Launch(LaunchEvent::Finished { profile_id }) => {
                     running_profile_ids_poll.borrow_mut().remove(&profile_id);
                     pending_launches_poll.borrow_mut().remove(&profile_id);
+                    home_card_launch_states_poll
+                        .borrow_mut()
+                        .remove(&profile_id);
+                    (render_home_cards_poll)();
                     let another_game_running = !running_profile_ids_poll.borrow().is_empty();
                     let another_launch_pending = !pending_launches_poll.borrow().is_empty();
                     game_running_poll.set(another_game_running);
@@ -4341,6 +4475,10 @@ fn build_ui(app: &Application) {
                 AppEvent::Launch(LaunchEvent::Failed { profile_id, error }) => {
                     running_profile_ids_poll.borrow_mut().remove(&profile_id);
                     pending_launches_poll.borrow_mut().remove(&profile_id);
+                    home_card_launch_states_poll
+                        .borrow_mut()
+                        .remove(&profile_id);
+                    (render_home_cards_poll)();
                     let another_game_running = !running_profile_ids_poll.borrow().is_empty();
                     let another_launch_pending = !pending_launches_poll.borrow().is_empty();
                     game_running_poll.set(another_game_running);
@@ -4491,6 +4629,8 @@ fn build_ui(app: &Application) {
     let task_active_launch = task_active.clone();
     let pending_launches_launch = pending_launches.clone();
     let launch_progress_css_launch = launch_progress_css.clone();
+    let process_registry_launch = process_registry.clone();
+    let stop_registry_launch = stop_registry.clone();
 
     btn_play.connect_clicked(move |button| {
         if task_active_launch.get() {
@@ -4567,6 +4707,8 @@ fn build_ui(app: &Application) {
         };
 
         let thread_tx = tx.clone();
+        let process_registry_thread = process_registry_launch.clone();
+        let stop_registry_thread = stop_registry_launch.clone();
         thread::spawn(move || {
             launch_service::LaunchService::run(
                 selected_profile,
@@ -4574,6 +4716,8 @@ fn build_ui(app: &Application) {
                 java_path_raw,
                 java_install_policy,
                 thread_tx,
+                process_registry_thread,
+                stop_registry_thread,
             );
         });
     });
