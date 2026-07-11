@@ -1,3 +1,5 @@
 /target
+/crates/*/target
+/crates/*/Cargo.lock
 /.minecraft
 /dist

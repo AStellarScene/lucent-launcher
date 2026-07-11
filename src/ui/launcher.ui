@@ -617,29 +617,29 @@
     </property>
 
     <child type="bottom">
-      <object class="GtkCenterBox" id="bottom_deck">
-        <property name="margin-start">16</property>
-        <property name="margin-end">16</property>
-        <property name="margin-top">12</property>
-        <property name="margin-bottom">12</property>
+      <object class="GtkBox" id="bottom_deck">
+        <property name="orientation">vertical</property>
+        <property name="spacing">4</property>
+        <property name="hexpand">true</property>
 
-        <child type="start">
-          <object class="GtkBox" id="left_deck_section">
-            <property name="halign">start</property>
-            <property name="valign">center</property>
-            <child>
-              <object class="GtkDropDown" id="dropdown_profile_launch"/>
+        <child>
+          <object class="GtkCenterBox" id="launch_controls_deck">
+            <property name="margin-start">16</property>
+            <property name="margin-end">16</property>
+            <property name="margin-top">12</property>
+            <property name="margin-bottom">8</property>
+
+            <child type="start">
+              <object class="GtkBox" id="left_deck_section">
+                <property name="halign">start</property>
+                <property name="valign">center</property>
+                <child>
+                  <object class="GtkDropDown" id="dropdown_profile_launch"/>
+                </child>
+              </object>
             </child>
-          </object>
-        </child>
 
-        <child type="center">
-          <object class="GtkBox" id="center_deck_section">
-            <property name="orientation">vertical</property>
-            <property name="spacing">6</property>
-            <property name="halign">center</property>
-            <property name="valign">center</property>
-            <child>
+            <child type="center">
               <object class="GtkButton" id="btn_play">
                 <property name="label">Launch</property>
                 <property name="width-request">180</property>
@@ -649,51 +649,73 @@
                 </style>
               </object>
             </child>
-            <child>
-              <object class="GtkProgressBar" id="progress_bar">
-                <property name="visible">false</property>
-                <property name="width-request">180</property>
+
+            <child type="end">
+              <object class="GtkBox" id="right_deck_section">
+                <property name="orientation">horizontal</property>
+                <property name="spacing">16</property>
+                <property name="halign">end</property>
                 <property name="valign">center</property>
+
+                <child>
+                  <object class="GtkBox" id="greeting_text_layout">
+                    <property name="orientation">vertical</property>
+                    <property name="spacing">2</property>
+                    <child>
+                      <object class="GtkLabel" id="lbl_welcome_user">
+                        <property name="halign">end</property>
+                        <style><class name="heading"/></style>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkLabel" id="lbl_ready_status">
+                        <property name="halign">end</property>
+                        <style><class name="dim-label"/></style>
+                      </object>
+                    </child>
+                  </object>
+                </child>
+
+                <child>
+                  <object class="GtkButton" id="btn_switch_user">
+                    <property name="label">Switch User</property>
+                    <property name="valign">center</property>
+                  </object>
+                </child>
               </object>
             </child>
           </object>
         </child>
 
-        <child type="end">
-          <object class="GtkBox" id="right_deck_section">
-            <property name="orientation">horizontal</property>
-            <property name="spacing">16</property>
-            <property name="halign">end</property>
+        <child>
+          <object class="GtkProgressBar" id="progress_bar">
+            <property name="visible">false</property>
+            <property name="hexpand">true</property>
+            <property name="halign">fill</property>
             <property name="valign">center</property>
-
-            <child>
-              <object class="GtkBox" id="greeting_text_layout">
-                <property name="orientation">vertical</property>
-                <property name="spacing">2</property>
-                <child>
-                  <object class="GtkLabel" id="lbl_welcome_user">
-                    <property name="halign">end</property>
-                    <style><class name="heading"/></style>
-                  </object>
-                </child>
-                <child>
-                  <object class="GtkLabel" id="lbl_ready_status">
-                    <property name="halign">end</property>
-                    <style><class name="dim-label"/></style>
-                  </object>
-                </child>
-              </object>
-            </child>
-
-            <child>
-              <object class="GtkButton" id="btn_switch_user">
-                <property name="label">Switch User</property>
-                <property name="valign">center</property>
-              </object>
-            </child>
+            <property name="margin-start">16</property>
+            <property name="margin-end">16</property>
+            <property name="show-text">false</property>
           </object>
         </child>
 
+        <child>
+          <object class="GtkLabel" id="lbl_progress">
+            <property name="visible">false</property>
+            <property name="hexpand">true</property>
+            <property name="halign">fill</property>
+            <property name="xalign">0</property>
+            <property name="width-request">1</property>
+            <property name="width-chars">1</property>
+            <property name="max-width-chars">1</property>
+            <property name="ellipsize">end</property>
+            <property name="single-line-mode">true</property>
+            <property name="margin-start">16</property>
+            <property name="margin-end">16</property>
+            <property name="margin-bottom">6</property>
+            <style><class name="dim-label"/></style>
+          </object>
+        </child>
       </object>
     </child>
 

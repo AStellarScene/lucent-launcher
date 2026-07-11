@@ -83,7 +83,7 @@ Useful options:
 - `scripts/windows/cargo-gnu.ps1` sets `PKG_CONFIG` and `PKG_CONFIG_PATH` for MSYS2.
 - A true single-file GTK executable is not supported with the MSYS2 GTK stack; use the portable folder/zip artifact.
 - MSIX tooling requires Windows SDK (`makeappx.exe`, `signtool.exe`).
-- Runtime still expects `src/ui/launcher.ui` relative to repository root.
+- The UI is embedded into the executable as a GResource; runtime does not require the repository's `src/ui/launcher.ui` path.
 - If `winget` is unavailable, install MSYS2 manually, then run:
   - `pacman -Syu --noconfirm`
   - `pacman -S --noconfirm --needed mingw-w64-x86_64-toolchain mingw-w64-x86_64-pkgconf mingw-w64-x86_64-gtk4 mingw-w64-x86_64-libadwaita`

@@ -12,28 +12,31 @@ use sha1::{Digest, Sha1};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 // Bring Libadwaita's underlying re-exported glib engine into scope
 use adw::glib;
 
+mod launch_service;
+mod messages;
+mod storage;
+
+use messages::{AppEvent, AuthEvent, DiscoveryEvent, LaunchEvent, VersionsEvent};
+use storage::{load_profiles_from_disk, minecraft_root_dir, save_profiles_to_disk};
+
 const MS_CLIENT_ID_ENV: &str = "LUCENT_MS_CLIENT_ID";
 const MS_REDIRECT_URI_ENV: &str = "LUCENT_MS_REDIRECT_URI";
 const DEFAULT_MS_REDIRECT_URI: &str = "http://localhost:53682/callback";
 const KEYRING_SERVICE: &str = "com.lucentlauncher";
 const KEYRING_ACCOUNT: &str = "microsoft-refresh-token";
-const PROFILES_FILE_NAME: &str = "profiles.json";
 const UI_RESOURCE_PATH: &str = "/com/lucentlauncher/ui/launcher.ui";
-const DATA_DIR_ENV: &str = "LUCENT_DATA_DIR";
-const APP_DATA_SUBDIR: &str = "lucent-launcher";
 const JVM_MANIFEST_URL: &str = "https://launchermeta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json";
 
 #[derive(Clone)]
@@ -73,20 +76,17 @@ enum ProfileLoaderVersion {
     Exact(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 enum ProfileColorMode {
+    #[default]
     Auto,
     Custom,
 }
 
-impl Default for ProfileColorMode {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LauncherProfile {
+    #[serde(default = "storage::new_profile_id")]
+    id: String,
     name: String,
     version_id: String,
     loader: ProfileLoader,
@@ -112,6 +112,7 @@ fn default_java_auto_download() -> bool {
 impl LauncherProfile {
     fn default_with_version(version_id: String) -> Self {
         Self {
+            id: storage::new_profile_id(),
             name: "Default".to_string(),
             version_id,
             loader: ProfileLoader::Vanilla,
@@ -170,14 +171,15 @@ fn parse_extra_jvm_arguments(raw: Option<&str>) -> Vec<String> {
 }
 
 fn apply_profile_runtime_jvm_overrides(
-    args: &mut Vec<String>,
+    command: &mut mc_launcher_core::command::builder::LaunchCommand,
     main_class: Option<&str>,
     memory_mb: Option<u32>,
     extra_args: Option<&str>,
 ) -> usize {
     let mut insert_args: Vec<String> = Vec::new();
+    let effective_memory = memory_mb.filter(|value| *value > 0);
 
-    if let Some(mb) = memory_mb.filter(|v| *v > 0) {
+    if let Some(mb) = effective_memory {
         insert_args.push(format!("-Xmx{mb}M"));
     }
     insert_args.extend(parse_extra_jvm_arguments(extra_args));
@@ -186,29 +188,26 @@ fn apply_profile_runtime_jvm_overrides(
         return 0;
     }
 
-    let mut main_idx = main_class
-        .and_then(|main| args.iter().position(|a| a == main))
-        .unwrap_or(args.len());
-
-    if memory_mb.is_some() {
-        let before_main = &args[..main_idx];
-        let mut retained = Vec::with_capacity(before_main.len());
-        for arg in before_main {
-            if !arg.starts_with("-Xmx") {
-                retained.push(arg.clone());
-            }
-        }
+    if effective_memory.is_some() {
+        let main_idx = main_class
+            .and_then(|main| command.args.iter().position(|arg| arg == main))
+            .unwrap_or(command.args.len());
+        let before_main = &command.args[..main_idx];
+        let retained: Vec<String> = before_main
+            .iter()
+            .filter(|arg| !arg.starts_with("-Xmx"))
+            .cloned()
+            .collect();
         let removed = before_main.len().saturating_sub(retained.len());
         if removed > 0 {
             let mut rebuilt = retained;
-            rebuilt.extend_from_slice(&args[main_idx..]);
-            *args = rebuilt;
-            main_idx = main_idx.saturating_sub(removed);
+            rebuilt.extend_from_slice(&command.args[main_idx..]);
+            command.args = rebuilt;
         }
     }
 
-    args.splice(main_idx..main_idx, insert_args.clone());
-    insert_args.len()
+    // The vendored core owns the JVM/game argument boundary.
+    command.insert_jvm_arguments(main_class, insert_args)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,38 +325,6 @@ struct PlatformManifest {
     files: HashMap<String, RuntimeFileEntry>,
 }
 
-// Messages sent from worker threads back to UI thread.
-enum LauncherMessage {
-    VersionsLoaded(Vec<String>),
-    Log(String),
-    StatusUpdate(String),
-    TaskFinished,
-    TaskFailed(String),
-    OpenUrl(String),
-    MicrosoftAuthSuccess {
-        username: String,
-        uuid: String,
-        access_token: String,
-        refresh_token: String,
-    },
-    MicrosoftAuthFailed(String),
-    DiscoverySearchResults {
-        kind: DiscoveryKind,
-        query: String,
-        results: Vec<DiscoveryCardData>,
-    },
-    DiscoverySearchFailed {
-        kind: DiscoveryKind,
-        error: String,
-    },
-    DiscoveryInstallFinished {
-        kind: DiscoveryKind,
-        title: String,
-        target_path: String,
-    },
-    DiscoveryInstalledChanged(DiscoveryKind),
-}
-
 fn main() {
     if let Err(e) = gtk::gio::resources_register_include!("lucent-launcher.gresource") {
         panic!("failed registering embedded UI resources: {e}");
@@ -367,7 +334,13 @@ fn main() {
         .application_id("com.lucentlauncher")
         .build();
 
-    app.connect_activate(build_ui);
+    app.connect_activate(|app| {
+        if let Some(window) = app.windows().into_iter().next() {
+            window.present();
+        } else {
+            build_ui(app);
+        }
+    });
     app.run();
 }
 
@@ -399,101 +372,6 @@ fn clear_refresh_token() -> Result<(), String> {
         Err(KeyringError::NoEntry) => Ok(()),
         Err(e) => Err(format!("keyring delete failed: {e}")),
     }
-}
-
-fn resolve_runtime_base_dir() -> Result<PathBuf, String> {
-    if let Ok(override_dir) = std::env::var(DATA_DIR_ENV) {
-        let trimmed = override_dir.trim();
-        if !trimmed.is_empty() {
-            let path = PathBuf::from(trimmed);
-            fs::create_dir_all(&path)
-                .map_err(|e| format!("failed creating runtime dir '{}': {e}", path.display()))?;
-            return Ok(path);
-        }
-    }
-
-    let legacy_base = std::env::current_dir()
-        .map_err(|e| format!("failed resolving current dir for runtime fallback: {e}"))?;
-
-    let mut preferred_base = dirs::data_local_dir()
-        .or_else(dirs::data_dir)
-        .unwrap_or_else(|| legacy_base.clone());
-    preferred_base.push(APP_DATA_SUBDIR);
-
-    fs::create_dir_all(&preferred_base).map_err(|e| {
-        format!(
-            "failed creating app data runtime dir '{}': {e}",
-            preferred_base.display()
-        )
-    })?;
-
-    let preferred_has_data = preferred_base.join(PROFILES_FILE_NAME).exists()
-        || preferred_base.join(".minecraft").exists();
-    let legacy_has_data = legacy_base.join(PROFILES_FILE_NAME).exists()
-        || legacy_base.join(".minecraft").exists();
-
-    if !preferred_has_data && legacy_has_data {
-        let legacy_profiles = legacy_base.join(PROFILES_FILE_NAME);
-        let preferred_profiles = preferred_base.join(PROFILES_FILE_NAME);
-        if legacy_profiles.exists() && !preferred_profiles.exists() {
-            fs::copy(&legacy_profiles, &preferred_profiles).map_err(|e| {
-                format!(
-                    "failed migrating legacy profiles '{}' -> '{}': {e}",
-                    legacy_profiles.display(),
-                    preferred_profiles.display()
-                )
-            })?;
-        }
-
-        let legacy_mc = legacy_base.join(".minecraft");
-        let preferred_mc = preferred_base.join(".minecraft");
-        if legacy_mc.exists() && !preferred_mc.exists() {
-            if let Err(e) = fs::rename(&legacy_mc, &preferred_mc) {
-                eprintln!(
-                    "[WARN] Failed migrating legacy .minecraft dir '{}' -> '{}': {e}. Falling back to legacy runtime path.",
-                    legacy_mc.display(),
-                    preferred_mc.display()
-                );
-                return Ok(legacy_base);
-            }
-        }
-    }
-
-    Ok(preferred_base)
-}
-
-fn runtime_base_dir() -> Result<PathBuf, String> {
-    resolve_runtime_base_dir()
-}
-
-fn minecraft_root_dir() -> Result<PathBuf, String> {
-    let root = runtime_base_dir()?.join(".minecraft");
-    fs::create_dir_all(&root)
-        .map_err(|e| format!("failed creating minecraft dir '{}': {e}", root.display()))?;
-    Ok(root)
-}
-
-fn profiles_file_path() -> Result<PathBuf, String> {
-    Ok(runtime_base_dir()?.join(PROFILES_FILE_NAME))
-}
-
-fn load_profiles_from_disk() -> Result<Vec<LauncherProfile>, String> {
-    let path = profiles_file_path()?;
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-
-    let content =
-        fs::read_to_string(&path).map_err(|e| format!("failed reading {}: {e}", path.display()))?;
-    serde_json::from_str::<Vec<LauncherProfile>>(&content)
-        .map_err(|e| format!("failed parsing {}: {e}", path.display()))
-}
-
-fn save_profiles_to_disk(profiles: &[LauncherProfile]) -> Result<(), String> {
-    let path = profiles_file_path()?;
-    let content = serde_json::to_string_pretty(profiles)
-        .map_err(|e| format!("failed serializing profiles: {e}"))?;
-    fs::write(&path, content).map_err(|e| format!("failed writing {}: {e}", path.display()))
 }
 
 fn loader_from_index(index: u32) -> ProfileLoader {
@@ -584,7 +462,10 @@ fn hex_to_rgb(hex: &str) -> Option<(u8, u8, u8)> {
     Some((r, g, b))
 }
 
-fn mix_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
+type RgbColor = (u8, u8, u8);
+type ProfileGradient = (RgbColor, RgbColor, RgbColor);
+
+fn mix_rgb(a: RgbColor, b: RgbColor, t: f32) -> RgbColor {
     let t = t.clamp(0.0, 1.0);
     let mix = |x: u8, y: u8| -> u8 {
         ((x as f32 * (1.0 - t) + y as f32 * t).round()).clamp(0.0, 255.0) as u8
@@ -592,18 +473,15 @@ fn mix_rgb(a: (u8, u8, u8), b: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
     (mix(a.0, b.0), mix(a.1, b.1), mix(a.2, b.2))
 }
 
-fn profile_gradient_colors(
-    profile: &LauncherProfile,
-) -> ((u8, u8, u8), (u8, u8, u8), (u8, u8, u8)) {
-    if profile.color_mode == ProfileColorMode::Custom {
-        if let Some(hex) = profile.color_hex.as_deref() {
-            if let Some(base) = hex_to_rgb(hex) {
-                let c1 = mix_rgb(base, (255, 255, 255), 0.28);
-                let c2 = base;
-                let c3 = mix_rgb(base, (16, 20, 28), 0.30);
-                return (c1, c2, c3);
-            }
-        }
+fn profile_gradient_colors(profile: &LauncherProfile) -> ProfileGradient {
+    if profile.color_mode == ProfileColorMode::Custom
+        && let Some(hex) = profile.color_hex.as_deref()
+        && let Some(base) = hex_to_rgb(hex)
+    {
+        let c1 = mix_rgb(base, (255, 255, 255), 0.28);
+        let c2 = base;
+        let c3 = mix_rgb(base, (16, 20, 28), 0.30);
+        return (c1, c2, c3);
     }
 
     let mut hash: u32 = 0;
@@ -771,10 +649,37 @@ fn sanitize_component_for_path(input: &str) -> String {
         .collect()
 }
 
+fn write_runtime_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    mc_launcher_core::io::atomic::write_bytes(path, bytes)
+        .map_err(|e| format!("failed writing '{}': {e}", path.display()))
+}
+
 fn profile_game_directory(profile: &LauncherProfile) -> Result<PathBuf, String> {
-    let root = minecraft_root_dir()?
-        .join("profiles")
-        .join(sanitize_component_for_path(&profile.name));
+    let profiles_root = minecraft_root_dir()?.join("profiles");
+    fs::create_dir_all(&profiles_root)
+        .map_err(|e| format!("failed creating '{}': {e}", profiles_root.display()))?;
+
+    let profile_id = if profile.id.is_empty() {
+        sanitize_component_for_path(&profile.name)
+    } else {
+        sanitize_component_for_path(&profile.id)
+    };
+    let root = profiles_root.join(profile_id);
+
+    // Preserve content created by older releases that used the display name as
+    // the directory identity. The migration is one-way and happens only when
+    // the stable-ID directory does not exist yet.
+    let legacy_root = profiles_root.join(sanitize_component_for_path(&profile.name));
+    if root != legacy_root && !root.exists() && legacy_root.exists() {
+        fs::rename(&legacy_root, &root).map_err(|e| {
+            format!(
+                "failed migrating profile directory '{}' -> '{}': {e}",
+                legacy_root.display(),
+                root.display()
+            )
+        })?;
+    }
+
     fs::create_dir_all(&root).map_err(|e| format!("failed creating '{}': {e}", root.display()))?;
     Ok(root)
 }
@@ -971,7 +876,11 @@ fn profile_loader_modrinth_loaders(profile: &LauncherProfile) -> Vec<&'static st
 }
 
 fn is_modrinth_version_compatible(version: &ModrinthVersion, profile: &LauncherProfile) -> bool {
-    if !version.game_versions.iter().any(|v| v == &profile.version_id) {
+    if !version
+        .game_versions
+        .iter()
+        .any(|v| v == &profile.version_id)
+    {
         return false;
     }
 
@@ -1081,14 +990,17 @@ fn fetch_compatible_modrinth_version_for_project(
         .json::<Vec<ModrinthVersion>>()
         .map_err(|e| format!("failed decoding Modrinth project versions: {e}"))?;
 
-    Ok(versions
-        .into_iter()
-        .find(|version| is_modrinth_version_compatible(version, profile) && !version.files.is_empty()))
+    Ok(versions.into_iter().find(|version| {
+        is_modrinth_version_compatible(version, profile) && !version.files.is_empty()
+    }))
 }
 
 fn disable_mod_file(path: &Path) -> Result<PathBuf, String> {
     let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
-        return Err(format!("failed resolving filename for '{}'", path.display()));
+        return Err(format!(
+            "failed resolving filename for '{}'",
+            path.display()
+        ));
     };
 
     let disabled_path = path.with_file_name(format!("{file_name}.disabled"));
@@ -1114,7 +1026,12 @@ fn apply_modrinth_update_to_mod_path(
 
     let target_path = existing_path
         .parent()
-        .ok_or_else(|| format!("failed resolving parent dir for '{}'", existing_path.display()))?
+        .ok_or_else(|| {
+            format!(
+                "failed resolving parent dir for '{}'",
+                existing_path.display()
+            )
+        })?
         .join(sanitize_component_for_path(&file.filename));
 
     let bytes = Client::new()
@@ -1127,8 +1044,7 @@ fn apply_modrinth_update_to_mod_path(
         .bytes()
         .map_err(|e| format!("failed reading compatible mod update bytes: {e}"))?;
 
-    fs::write(&target_path, bytes)
-        .map_err(|e| format!("failed writing '{}': {e}", target_path.display()))?;
+    write_runtime_file(&target_path, &bytes)?;
 
     if target_path != existing_path {
         fs::remove_file(existing_path).map_err(|e| {
@@ -1144,7 +1060,7 @@ fn apply_modrinth_update_to_mod_path(
 
 fn auto_repair_profile_mods(
     profile: &LauncherProfile,
-    tx: &mpsc::Sender<LauncherMessage>,
+    tx: &mpsc::Sender<AppEvent>,
 ) -> Result<ModRepairSummary, String> {
     let mods_dir = profile_content_dir(profile, DiscoveryKind::Mods)?;
     let mut summary = ModRepairSummary {
@@ -1180,7 +1096,7 @@ fn auto_repair_profile_mods(
         return Ok(summary);
     }
 
-    let _ = tx.send(LauncherMessage::Log(format!(
+    let _ = tx.send(AppEvent::Log(format!(
         "Auto-repair: checking {} enabled mod(s) for compatibility (MC {}, loader {})",
         enabled_mods.len(),
         profile.version_id,
@@ -1203,19 +1119,19 @@ fn auto_repair_profile_mods(
         match current_version {
             None => {
                 summary.unknown += 1;
-                let _ = tx.send(LauncherMessage::Log(format!(
+                let _ = tx.send(AppEvent::Log(format!(
                     "Auto-repair: '{}' not found on Modrinth hash index; leaving enabled",
                     mod_name
                 )));
             }
             Some(version) if is_modrinth_version_compatible(&version, profile) => {
-                let _ = tx.send(LauncherMessage::Log(format!(
+                let _ = tx.send(AppEvent::Log(format!(
                     "Auto-repair: '{}' is compatible",
                     mod_name
                 )));
             }
             Some(version) => {
-                let _ = tx.send(LauncherMessage::Log(format!(
+                let _ = tx.send(AppEvent::Log(format!(
                     "Auto-repair: '{}' is incompatible, searching same-mod compatible replacement...",
                     mod_name
                 )));
@@ -1223,7 +1139,9 @@ fn auto_repair_profile_mods(
                 let replacement = fetch_modrinth_compatible_update_for_hash(&hash, profile)?
                     .or_else(|| {
                         version.project_id.as_deref().and_then(|project_id| {
-                            fetch_compatible_modrinth_version_for_project(project_id, profile).ok().flatten()
+                            fetch_compatible_modrinth_version_for_project(project_id, profile)
+                                .ok()
+                                .flatten()
                         })
                     });
 
@@ -1234,12 +1152,12 @@ fn auto_repair_profile_mods(
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("<unknown>");
-                    let _ = tx.send(LauncherMessage::Log(format!(
+                    let _ = tx.send(AppEvent::Log(format!(
                         "Auto-repair: replaced '{}' with compatible '{}'",
                         mod_name, updated_name
                     )));
                 } else {
-                    let _ = tx.send(LauncherMessage::Log(format!(
+                    let _ = tx.send(AppEvent::Log(format!(
                         "Auto-repair: no compatible replacement found for '{}'; will disable after retrieval phase",
                         mod_name
                     )));
@@ -1258,7 +1176,7 @@ fn auto_repair_profile_mods(
             .unwrap_or("<unknown>")
             .to_string();
         summary.disabled_mods.push(disabled_name.clone());
-        let _ = tx.send(LauncherMessage::Log(format!(
+        let _ = tx.send(AppEvent::Log(format!(
             "Auto-repair: disabled incompatible mod '{}'",
             disabled_name
         )));
@@ -1305,10 +1223,10 @@ fn install_modrinth_project(
                 return false;
             }
 
-            if kind == DiscoveryKind::Mods {
-                if let Some(loader) = wanted_loader {
-                    return v.loaders.iter().any(|l| l.eq_ignore_ascii_case(loader));
-                }
+            if kind == DiscoveryKind::Mods
+                && let Some(loader) = wanted_loader
+            {
+                return v.loaders.iter().any(|l| l.eq_ignore_ascii_case(loader));
             }
 
             true
@@ -1349,8 +1267,7 @@ fn install_modrinth_project(
         .bytes()
         .map_err(|e| format!("failed reading download bytes: {e}"))?;
 
-    fs::write(&target_path, bytes)
-        .map_err(|e| format!("failed writing '{}': {e}", target_path.display()))?;
+    write_runtime_file(&target_path, &bytes)?;
 
     Ok(target_path)
 }
@@ -1382,83 +1299,13 @@ fn maven_artifact_relative_path(name: &str) -> Option<PathBuf> {
     )
 }
 
-fn classpath_dedupe_key(entry: &str) -> String {
-    let normalized = entry.replace('\\', "/");
-
-    if let Some(idx) = normalized.find("/libraries/") {
-        let rel = &normalized[idx + "/libraries/".len()..];
-        let parts: Vec<&str> = rel.split('/').filter(|p| !p.is_empty()).collect();
-        if parts.len() >= 4 {
-            let artifact = parts[parts.len() - 3];
-            let version = parts[parts.len() - 2];
-            let file = parts[parts.len() - 1];
-            let group = parts[..parts.len() - 3].join(".");
-
-            let stem = file.strip_suffix(".jar").unwrap_or(file);
-            let prefix = format!("{artifact}-{version}");
-            let classifier = if stem == prefix {
-                ""
-            } else if let Some(rest) = stem.strip_prefix(&(prefix + "-")) {
-                rest
-            } else {
-                ""
-            };
-
-            return format!("maven:{group}:{artifact}:{classifier}");
-        }
-    }
-
-    format!("path:{normalized}")
-}
-
-fn dedupe_classpath_string(classpath: &str) -> (String, usize) {
-    let separator = if classpath.contains(';') { ';' } else { ':' };
-    let entries: Vec<String> = classpath
-        .split(separator)
-        .filter(|e| !e.is_empty())
-        .map(|e| e.to_string())
-        .collect();
-
-    if entries.is_empty() {
-        return (classpath.to_string(), 0);
-    }
-
-    let mut last_seen_index: HashMap<String, usize> = HashMap::new();
-    for (idx, entry) in entries.iter().enumerate() {
-        last_seen_index.insert(classpath_dedupe_key(entry), idx);
-    }
-
-    let mut kept = Vec::with_capacity(entries.len());
-    for (idx, entry) in entries.iter().enumerate() {
-        let key = classpath_dedupe_key(entry);
-        if last_seen_index.get(&key) == Some(&idx) {
-            kept.push(entry.clone());
-        }
-    }
-
-    let removed = entries.len().saturating_sub(kept.len());
-    (kept.join(&separator.to_string()), removed)
-}
-
-fn dedupe_launch_classpath(args: &mut [String]) -> usize {
-    for idx in 0..args.len().saturating_sub(1) {
-        if args[idx] == "-cp" || args[idx] == "-classpath" {
-            let (deduped, removed) = dedupe_classpath_string(&args[idx + 1]);
-            args[idx + 1] = deduped;
-            return removed;
-        }
-    }
-    0
-}
-
 fn resolve_latest_forge_version_for_minecraft(minecraft_version: &str) -> Result<String, String> {
     let versions = mc_launcher_core::loader::forge::list_forge_versions()
         .map_err(|e| format!("failed listing Forge versions: {e}"))?;
 
     versions
         .into_iter()
-        .filter(|v| v.starts_with(&format!("{minecraft_version}-")))
-        .last()
+        .rfind(|v| v.starts_with(&format!("{minecraft_version}-")))
         .ok_or_else(|| {
             format!(
                 "No Forge versions found for Minecraft {}. Choose Exact loader version or a different Minecraft version.",
@@ -1492,8 +1339,7 @@ fn ensure_launcher_profiles_json(minecraft_dir: &Path) -> Result<(), String> {
 
     let content = serde_json::to_string_pretty(&scaffold)
         .map_err(|e| format!("failed serializing launcher_profiles.json scaffold: {e}"))?;
-    fs::write(&launcher_profiles_path, content)
-        .map_err(|e| format!("failed writing '{}': {e}", launcher_profiles_path.display()))
+    write_runtime_file(&launcher_profiles_path, content.as_bytes())
 }
 
 fn java_binary_names() -> &'static [&'static str] {
@@ -1537,7 +1383,11 @@ fn discover_java_from_env() -> Option<PathBuf> {
         ];
 
         if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-            roots.push(PathBuf::from(local_app_data).join("Programs").join("Eclipse Adoptium"));
+            roots.push(
+                PathBuf::from(local_app_data)
+                    .join("Programs")
+                    .join("Eclipse Adoptium"),
+            );
         }
 
         for root in roots {
@@ -1590,7 +1440,7 @@ fn ensure_runtime_java_for_version(
     minecraft_dir: &Path,
     version_id: &str,
     version_meta: Option<&mc_launcher_core::core::version::VersionJson>,
-    tx: &mpsc::Sender<LauncherMessage>,
+    tx: &mpsc::Sender<AppEvent>,
 ) -> Result<Option<PathBuf>, String> {
     let runtime_component = version_meta
         .and_then(|meta| meta.java_version.as_ref().map(|j| j.component.clone()))
@@ -1606,7 +1456,7 @@ fn ensure_runtime_java_for_version(
     if let Some(executable) =
         mc_launcher_core::runtime::get_executable_path(&runtime_component, minecraft_dir)
     {
-        let _ = tx.send(LauncherMessage::Log(format!(
+        let _ = tx.send(AppEvent::Log(format!(
             "Using managed Java runtime '{}' from {}",
             runtime_component,
             executable.display()
@@ -1614,7 +1464,7 @@ fn ensure_runtime_java_for_version(
         return Ok(Some(executable));
     }
 
-    let _ = tx.send(LauncherMessage::Log(format!(
+    let _ = tx.send(AppEvent::Log(format!(
         "No managed Java runtime found for '{}'; downloading runtime component '{}'...",
         version_id, runtime_component
     )));
@@ -1623,7 +1473,7 @@ fn ensure_runtime_java_for_version(
     if let Err(primary_err) =
         mc_launcher_core::runtime::install_jvm_runtime(&runtime_component, minecraft_dir, &callback)
     {
-        let _ = tx.send(LauncherMessage::Log(format!(
+        let _ = tx.send(AppEvent::Log(format!(
             "Primary Java runtime install failed for '{}': {}. Retrying with raw-file runtime installer...",
             runtime_component, primary_err
         )));
@@ -1634,7 +1484,7 @@ fn ensure_runtime_java_for_version(
     if let Some(executable) =
         mc_launcher_core::runtime::get_executable_path(&runtime_component, minecraft_dir)
     {
-        let _ = tx.send(LauncherMessage::Log(format!(
+        let _ = tx.send(AppEvent::Log(format!(
             "Installed managed Java runtime '{}' at {}",
             runtime_component,
             executable.display()
@@ -1668,10 +1518,7 @@ fn runtime_safe_join(base: &Path, rel: &str) -> Result<PathBuf, String> {
             std::path::Component::Normal(part) => out.push(part),
             std::path::Component::CurDir => {}
             _ => {
-                return Err(format!(
-                    "unsafe runtime manifest path rejected: {}",
-                    rel
-                ));
+                return Err(format!("unsafe runtime manifest path rejected: {}", rel));
             }
         }
     }
@@ -1725,8 +1572,12 @@ fn install_jvm_runtime_raw_files(jvm_component: &str, minecraft_dir: &Path) -> R
         .join(jvm_component)
         .join(platform)
         .join(jvm_component);
-    fs::create_dir_all(&runtime_root)
-        .map_err(|e| format!("failed creating runtime dir '{}': {e}", runtime_root.display()))?;
+    fs::create_dir_all(&runtime_root).map_err(|e| {
+        format!(
+            "failed creating runtime dir '{}': {e}",
+            runtime_root.display()
+        )
+    })?;
 
     for (rel_path, file_entry) in platform_manifest.files {
         let Some(kind) = file_entry.kind.as_deref() else {
@@ -1737,7 +1588,10 @@ fn install_jvm_runtime_raw_files(jvm_component: &str, minecraft_dir: &Path) -> R
         match kind {
             "directory" => {
                 fs::create_dir_all(&destination).map_err(|e| {
-                    format!("failed creating runtime directory '{}': {e}", destination.display())
+                    format!(
+                        "failed creating runtime directory '{}': {e}",
+                        destination.display()
+                    )
                 })?;
             }
             "file" => {
@@ -1748,7 +1602,10 @@ fn install_jvm_runtime_raw_files(jvm_component: &str, minecraft_dir: &Path) -> R
                 }
 
                 let downloads = file_entry.downloads.ok_or_else(|| {
-                    format!("runtime manifest missing download metadata for '{}': {}", jvm_component, rel_path)
+                    format!(
+                        "runtime manifest missing download metadata for '{}': {}",
+                        jvm_component, rel_path
+                    )
                 })?;
 
                 let bytes = client
@@ -1768,9 +1625,7 @@ fn install_jvm_runtime_raw_files(jvm_component: &str, minecraft_dir: &Path) -> R
                     ));
                 }
 
-                fs::write(&destination, &bytes).map_err(|e| {
-                    format!("failed writing runtime file '{}': {e}", destination.display())
-                })?;
+                write_runtime_file(&destination, &bytes)?;
 
                 #[cfg(unix)]
                 {
@@ -1828,42 +1683,13 @@ fn resolve_preferred_java_executable(java_path_raw: &str) -> Result<Option<PathB
     Ok(discover_java_from_env())
 }
 
-fn spawn_progress_heartbeat(
-    tx: &mpsc::Sender<LauncherMessage>,
-    stage: &str,
-    interval: Duration,
-) -> Arc<AtomicBool> {
-    let running = Arc::new(AtomicBool::new(true));
-    let running_bg = Arc::clone(&running);
-    let tx_bg = tx.clone();
-    let stage_label = stage.to_string();
-
-    thread::spawn(move || {
-        let started = Instant::now();
-        while running_bg.load(Ordering::Relaxed) {
-            thread::sleep(interval);
-            if !running_bg.load(Ordering::Relaxed) {
-                break;
-            }
-
-            let _ = tx_bg.send(LauncherMessage::Log(format!(
-                "[progress] {} still running ({}s elapsed)...",
-                stage_label,
-                started.elapsed().as_secs()
-            )));
-        }
-    });
-
-    running
-}
-
 fn install_forge_profile_with_java(
     launcher: &mc_launcher_core::launcher::Launcher,
     minecraft_version: &str,
     forge_version: &str,
     java_path_raw: &str,
     java_auto_download: bool,
-    tx: &mpsc::Sender<LauncherMessage>,
+    tx: &mpsc::Sender<AppEvent>,
 ) -> Result<String, String> {
     use mc_launcher_core::install::InstallRequest;
 
@@ -1877,7 +1703,7 @@ fn install_forge_profile_with_java(
         })?;
 
     ensure_launcher_profiles_json(launcher.minecraft_dir())?;
-    let _ = tx.send(LauncherMessage::Log(
+    let _ = tx.send(AppEvent::Log(
         "Ensured launcher_profiles.json exists for Forge installer compatibility".to_string(),
     ));
 
@@ -1892,7 +1718,7 @@ fn install_forge_profile_with_java(
 
     let installer_path = installer_dir.join(format!("forge-{forge_version}-installer.jar"));
     if !installer_path.exists() {
-        let _ = tx.send(LauncherMessage::Log(format!(
+        let _ = tx.send(AppEvent::Log(format!(
             "Downloading Forge installer: {}",
             installer_url
         )));
@@ -1908,24 +1734,24 @@ fn install_forge_profile_with_java(
             .bytes()
             .map_err(|e| format!("failed reading Forge installer bytes: {e}"))?;
 
-        fs::write(&installer_path, bytes).map_err(|e| {
-            format!(
-                "failed writing Forge installer '{}': {e}",
-                installer_path.display()
-            )
-        })?;
+        write_runtime_file(&installer_path, &bytes)?;
     }
 
     let java_executable = match resolve_preferred_java_executable(java_path_raw) {
         Ok(Some(path)) => path,
         Ok(None) => {
             if java_auto_download {
-                match ensure_runtime_java_for_version(launcher.minecraft_dir(), minecraft_version, None, tx) {
+                match ensure_runtime_java_for_version(
+                    launcher.minecraft_dir(),
+                    minecraft_version,
+                    None,
+                    tx,
+                ) {
                     Ok(Some(path)) => path,
                     Ok(None) => {
                         return Err(
-                            "No Java runtime could be resolved for Forge installation".to_string(),
-                        )
+                            "No Java runtime could be resolved for Forge installation".to_string()
+                        );
                     }
                     Err(e) => return Err(e),
                 }
@@ -1939,13 +1765,13 @@ fn install_forge_profile_with_java(
         Err(e) => return Err(e),
     };
 
-    let _ = tx.send(LauncherMessage::Log(format!(
+    let _ = tx.send(AppEvent::Log(format!(
         "Running Forge installer with Java '{}'",
         java_executable.display()
     )));
 
     if minecraft_version.starts_with("1.8.") || minecraft_version.starts_with("1.7.") {
-        let _ = tx.send(LauncherMessage::Log(
+        let _ = tx.send(AppEvent::Log(
             "[forge-installer] Legacy Forge detected; Java 8 is typically required for 1.7/1.8 installs"
                 .to_string(),
         ));
@@ -1958,15 +1784,15 @@ fn install_forge_profile_with_java(
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
-                let _ = tx.send(LauncherMessage::Log(format!("[forge-java] {line}")));
+                let _ = tx.send(AppEvent::Log(format!("[forge-java] {line}")));
             }
             let stderr = String::from_utf8_lossy(&output.stderr);
             for line in stderr.lines() {
-                let _ = tx.send(LauncherMessage::Log(format!("[forge-java] {line}")));
+                let _ = tx.send(AppEvent::Log(format!("[forge-java] {line}")));
             }
         }
         Err(e) => {
-            let _ = tx.send(LauncherMessage::Log(format!(
+            let _ = tx.send(AppEvent::Log(format!(
                 "[forge-java] failed running java -version: {e}"
             )));
         }
@@ -1990,7 +1816,7 @@ fn install_forge_profile_with_java(
         thread::spawn(move || {
             let reader = BufReader::new(stdout);
             for line in reader.lines().map_while(Result::ok) {
-                let _ = out_tx.send(LauncherMessage::Log(format!("[forge-installer] {line}")));
+                let _ = out_tx.send(AppEvent::Log(format!("[forge-installer] {line}")));
             }
         })
     });
@@ -2000,9 +1826,7 @@ fn install_forge_profile_with_java(
         thread::spawn(move || {
             let reader = BufReader::new(stderr);
             for line in reader.lines().map_while(Result::ok) {
-                let _ = err_tx.send(LauncherMessage::Log(format!(
-                    "[forge-installer:stderr] {line}"
-                )));
+                let _ = err_tx.send(AppEvent::Log(format!("[forge-installer:stderr] {line}")));
             }
         })
     });
@@ -2038,7 +1862,7 @@ fn install_forge_profile_with_java(
 fn ensure_maven_fallback_libraries_present(
     version: &mc_launcher_core::core::version::VersionJson,
     minecraft_dir: &Path,
-    tx: &mpsc::Sender<LauncherMessage>,
+    tx: &mpsc::Sender<AppEvent>,
 ) -> Result<(), String> {
     let client = Client::new();
 
@@ -2078,7 +1902,7 @@ fn ensure_maven_fallback_libraries_present(
             .replace(std::path::MAIN_SEPARATOR, "/");
         let url = format!("{base_url}{rel_url}");
 
-        let _ = tx.send(LauncherMessage::Log(format!(
+        let _ = tx.send(AppEvent::Log(format!(
             "Downloading missing library: {}",
             lib.name
         )));
@@ -2104,13 +1928,7 @@ fn ensure_maven_fallback_libraries_present(
             })?;
         }
 
-        fs::write(&destination, &bytes).map_err(|e| {
-            format!(
-                "failed writing library '{}' to '{}': {e}",
-                lib.name,
-                destination.display()
-            )
-        })?;
+        write_runtime_file(&destination, &bytes)?;
     }
 
     Ok(())
@@ -2361,18 +2179,18 @@ fn wait_for_oauth_redirect(listener: TcpListener, timeout: Duration) -> Result<S
     }
 }
 
-fn spawn_microsoft_login_flow(tx: mpsc::Sender<LauncherMessage>, client_id: String) {
+fn spawn_microsoft_login_flow(tx: mpsc::Sender<AppEvent>, client_id: String) {
     thread::spawn(move || {
         use mc_launcher_core::auth::microsoft_account;
 
-        let _ = tx.send(LauncherMessage::StatusUpdate(
+        let _ = tx.send(AppEvent::StatusUpdate(
             "Starting Microsoft sign-in...".to_string(),
         ));
 
         let redirect_uri = match resolve_microsoft_redirect_uri() {
             Ok(uri) => uri,
             Err(e) => {
-                let _ = tx.send(LauncherMessage::MicrosoftAuthFailed(e));
+                let _ = tx.send(AppEvent::auth_failed(e));
                 return;
             }
         };
@@ -2380,7 +2198,7 @@ fn spawn_microsoft_login_flow(tx: mpsc::Sender<LauncherMessage>, client_id: Stri
         let port = match parse_loopback_port_from_redirect_uri(&redirect_uri) {
             Some(port) => port,
             None => {
-                let _ = tx.send(LauncherMessage::MicrosoftAuthFailed(format!(
+                let _ = tx.send(AppEvent::auth_failed(format!(
                     "Invalid redirect URI format: {redirect_uri}"
                 )));
                 return;
@@ -2390,7 +2208,7 @@ fn spawn_microsoft_login_flow(tx: mpsc::Sender<LauncherMessage>, client_id: Stri
         let listener = match TcpListener::bind(("127.0.0.1", port)) {
             Ok(listener) => listener,
             Err(e) => {
-                let _ = tx.send(LauncherMessage::MicrosoftAuthFailed(format!(
+                let _ = tx.send(AppEvent::auth_failed(format!(
                     "Failed to open local callback port: {e}"
                 )));
                 return;
@@ -2400,18 +2218,18 @@ fn spawn_microsoft_login_flow(tx: mpsc::Sender<LauncherMessage>, client_id: Stri
         let (login_url, state, code_verifier) =
             microsoft_account::get_secure_login_data(&client_id, &redirect_uri, None);
 
-        let _ = tx.send(LauncherMessage::Log(format!(
+        let _ = tx.send(AppEvent::Log(format!(
             "Open browser for Microsoft login. Redirect URI: {redirect_uri}"
         )));
-        let _ = tx.send(LauncherMessage::OpenUrl(login_url.clone()));
-        let _ = tx.send(LauncherMessage::StatusUpdate(
+        let _ = tx.send(AppEvent::OpenUrl(login_url.clone()));
+        let _ = tx.send(AppEvent::StatusUpdate(
             "Waiting for Microsoft login in browser...".to_string(),
         ));
 
         let callback_url = match wait_for_oauth_redirect(listener, Duration::from_secs(180)) {
             Ok(url) => url,
             Err(e) => {
-                let _ = tx.send(LauncherMessage::MicrosoftAuthFailed(e));
+                let _ = tx.send(AppEvent::auth_failed(e));
                 return;
             }
         };
@@ -2419,7 +2237,7 @@ fn spawn_microsoft_login_flow(tx: mpsc::Sender<LauncherMessage>, client_id: Stri
         let (auth_code, callback_state) = match parse_auth_code_and_state(&callback_url) {
             Ok(parsed) => parsed,
             Err(e) => {
-                let _ = tx.send(LauncherMessage::MicrosoftAuthFailed(format!(
+                let _ = tx.send(AppEvent::auth_failed(format!(
                     "Failed parsing OAuth callback: {e}"
                 )));
                 return;
@@ -2427,7 +2245,7 @@ fn spawn_microsoft_login_flow(tx: mpsc::Sender<LauncherMessage>, client_id: Stri
         };
 
         if callback_state.as_deref() != Some(state.as_str()) {
-            let _ = tx.send(LauncherMessage::MicrosoftAuthFailed(
+            let _ = tx.send(AppEvent::auth_failed(
                 "OAuth callback state mismatch; aborting login for safety".to_string(),
             ));
             return;
@@ -2441,20 +2259,20 @@ fn spawn_microsoft_login_flow(tx: mpsc::Sender<LauncherMessage>, client_id: Stri
         ) {
             Ok((username, uuid, access_token, refresh_token)) => {
                 if let Err(e) = save_refresh_token(&refresh_token) {
-                    let _ = tx.send(LauncherMessage::Log(format!(
+                    let _ = tx.send(AppEvent::Log(format!(
                         "[WARN] Signed in, but failed to store refresh token in keyring: {e}"
                     )));
                 }
 
-                let _ = tx.send(LauncherMessage::MicrosoftAuthSuccess {
+                let _ = tx.send(AppEvent::auth_success(
                     username,
                     uuid,
                     access_token,
                     refresh_token,
-                });
+                ));
             }
             Err(e) => {
-                let _ = tx.send(LauncherMessage::MicrosoftAuthFailed(format!(
+                let _ = tx.send(AppEvent::auth_failed(format!(
                     "Microsoft login failed: {e}"
                 )));
             }
@@ -2463,36 +2281,36 @@ fn spawn_microsoft_login_flow(tx: mpsc::Sender<LauncherMessage>, client_id: Stri
 }
 
 fn spawn_microsoft_refresh_flow(
-    tx: mpsc::Sender<LauncherMessage>,
+    tx: mpsc::Sender<AppEvent>,
     client_id: String,
     refresh_token: String,
 ) {
     thread::spawn(move || {
-        let _ = tx.send(LauncherMessage::StatusUpdate(
+        let _ = tx.send(AppEvent::StatusUpdate(
             "Restoring Microsoft session...".to_string(),
         ));
 
         match complete_microsoft_refresh_resilient(&client_id, &refresh_token) {
             Ok((username, uuid, access_token, refresh_token)) => {
                 if let Err(e) = save_refresh_token(&refresh_token) {
-                    let _ = tx.send(LauncherMessage::Log(format!(
+                    let _ = tx.send(AppEvent::Log(format!(
                         "[WARN] Failed to rotate stored refresh token: {e}"
                     )));
                 }
 
-                let _ = tx.send(LauncherMessage::MicrosoftAuthSuccess {
+                let _ = tx.send(AppEvent::auth_success(
                     username,
                     uuid,
                     access_token,
                     refresh_token,
-                });
+                ));
             }
             Err(e) => {
                 let _ = clear_refresh_token();
-                let _ = tx.send(LauncherMessage::Log(
+                let _ = tx.send(AppEvent::Log(
                     "Stored Microsoft session is invalid; please sign in again.".to_string(),
                 ));
-                let _ = tx.send(LauncherMessage::MicrosoftAuthFailed(format!(
+                let _ = tx.send(AppEvent::auth_failed(format!(
                     "Microsoft session restore failed: {e}"
                 )));
             }
@@ -2544,7 +2362,11 @@ fn build_ui(app: &Application) {
     let text_view: TextView = builder.object("text_view").unwrap();
     let flow_home_profiles: WrapBox = builder.object("flow_home_profiles").unwrap();
     let progress_bar: ProgressBar = builder.object("progress_bar").unwrap();
+    let lbl_progress: Label = builder.object("lbl_progress").unwrap();
     let bottom_deck: gtk::Widget = builder.object("bottom_deck").unwrap();
+
+    type RenderCallback = Rc<dyn Fn()>;
+    type RenderCallbackHolder = Rc<RefCell<Option<RenderCallback>>>;
 
     let launch_progress_css = CssProvider::new();
     if let Some(display) = gtk::gdk::Display::default() {
@@ -2603,7 +2425,7 @@ fn build_ui(app: &Application) {
         builder.object("btn_profile_shaders_sheet_install").unwrap();
 
     // --- 3. Standard thread Channel ---
-    let (tx, rx) = mpsc::channel::<LauncherMessage>();
+    let (tx, rx) = mpsc::channel::<AppEvent>();
 
     // --- 1. Populate Version/Profile Functionality ---
     let loading_model = StringList::new(&["Loading versions…"]);
@@ -2659,18 +2481,17 @@ fn build_ui(app: &Application) {
         let any_open = mods_sheet.is_open() || shaders_sheet_for_mods_open.is_open();
         bottom_deck_for_mods_open.set_visible(!any_open);
 
-        if mods_sheet.is_open() {
-            if let Some(root) = mods_sheet.root() {
-                if let Ok(window) = root.downcast::<gtk::ApplicationWindow>() {
-                    let h = window.height().max(1);
-                    let target_sheet_height = ((h as f32) * 0.80).round() as i32;
-                    let tab_scroll_height = (target_sheet_height - 170).clamp(220, 900);
-                    mods_installed_scroll_for_resize.set_max_content_height(tab_scroll_height);
-                    mods_installed_scroll_for_resize.set_min_content_height(tab_scroll_height);
-                    mods_results_scroll_for_resize.set_max_content_height(tab_scroll_height);
-                    mods_results_scroll_for_resize.set_min_content_height(tab_scroll_height);
-                }
-            }
+        if mods_sheet.is_open()
+            && let Some(root) = mods_sheet.root()
+            && let Ok(window) = root.downcast::<gtk::ApplicationWindow>()
+        {
+            let h = window.height().max(1);
+            let target_sheet_height = ((h as f32) * 0.80).round() as i32;
+            let tab_scroll_height = (target_sheet_height - 170).clamp(220, 900);
+            mods_installed_scroll_for_resize.set_max_content_height(tab_scroll_height);
+            mods_installed_scroll_for_resize.set_min_content_height(tab_scroll_height);
+            mods_results_scroll_for_resize.set_max_content_height(tab_scroll_height);
+            mods_results_scroll_for_resize.set_min_content_height(tab_scroll_height);
         }
     });
 
@@ -2682,18 +2503,17 @@ fn build_ui(app: &Application) {
         let any_open = shaders_sheet.is_open() || mods_sheet_for_shaders_open.is_open();
         bottom_deck_for_shaders_open.set_visible(!any_open);
 
-        if shaders_sheet.is_open() {
-            if let Some(root) = shaders_sheet.root() {
-                if let Ok(window) = root.downcast::<gtk::ApplicationWindow>() {
-                    let h = window.height().max(1);
-                    let target_sheet_height = ((h as f32) * 0.80).round() as i32;
-                    let tab_scroll_height = (target_sheet_height - 170).clamp(220, 900);
-                    shaders_installed_scroll_for_resize.set_max_content_height(tab_scroll_height);
-                    shaders_installed_scroll_for_resize.set_min_content_height(tab_scroll_height);
-                    shaders_results_scroll_for_resize.set_max_content_height(tab_scroll_height);
-                    shaders_results_scroll_for_resize.set_min_content_height(tab_scroll_height);
-                }
-            }
+        if shaders_sheet.is_open()
+            && let Some(root) = shaders_sheet.root()
+            && let Ok(window) = root.downcast::<gtk::ApplicationWindow>()
+        {
+            let h = window.height().max(1);
+            let target_sheet_height = ((h as f32) * 0.80).round() as i32;
+            let tab_scroll_height = (target_sheet_height - 170).clamp(220, 900);
+            shaders_installed_scroll_for_resize.set_max_content_height(tab_scroll_height);
+            shaders_installed_scroll_for_resize.set_min_content_height(tab_scroll_height);
+            shaders_results_scroll_for_resize.set_max_content_height(tab_scroll_height);
+            shaders_results_scroll_for_resize.set_min_content_height(tab_scroll_height);
         }
     });
 
@@ -2708,10 +2528,10 @@ fn build_ui(app: &Application) {
                     .filter(|v| v.r#type == "release")
                     .map(|v| v.id)
                     .collect();
-                let _ = versions_tx.send(LauncherMessage::VersionsLoaded(releases));
+                let _ = versions_tx.send(AppEvent::versions_loaded(releases));
             }
             Err(e) => {
-                let _ = versions_tx.send(LauncherMessage::TaskFailed(format!(
+                let _ = versions_tx.send(AppEvent::versions_failed(format!(
                     "Failed to query version manifest: {e}"
                 )));
             }
@@ -2736,16 +2556,19 @@ fn build_ui(app: &Application) {
     let mods_results_render = mods_results.clone();
     let flow_mods_results_render = flow_profile_mods_results.clone();
     let selected_mod_projects_render = selected_mod_projects.clone();
-    let render_mods_cards_holder: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+    let render_mods_cards_holder: RenderCallbackHolder = Rc::new(RefCell::new(None));
     let render_mods_cards_holder_for_init = render_mods_cards_holder.clone();
     let render_mods_cards: Rc<dyn Fn()> = Rc::new(move || {
         while let Some(child) = flow_mods_results_render.first_child() {
             flow_mods_results_render.remove(&child);
         }
 
-        let mut selected_items: Vec<DiscoveryCardData> =
-            selected_mod_projects_render.borrow().values().cloned().collect();
-        selected_items.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+        let mut selected_items: Vec<DiscoveryCardData> = selected_mod_projects_render
+            .borrow()
+            .values()
+            .cloned()
+            .collect();
+        selected_items.sort_by_key(|item| item.title.to_lowercase());
 
         if !selected_items.is_empty() {
             let selected_header = Label::new(Some("Selected for install"));
@@ -2792,7 +2615,9 @@ fn build_ui(app: &Application) {
                 let project_id = item.project_id.clone();
                 check.connect_toggled(move |c| {
                     if !c.is_active() {
-                        selected_mod_projects_toggle.borrow_mut().remove(&project_id);
+                        selected_mod_projects_toggle
+                            .borrow_mut()
+                            .remove(&project_id);
                         if let Some(render) = render_mods_cards_toggle.borrow().as_ref() {
                             (render)();
                         }
@@ -2891,16 +2716,19 @@ fn build_ui(app: &Application) {
     let shaders_results_render = shaders_results.clone();
     let flow_shaders_results_render = flow_profile_shaders_results.clone();
     let selected_shader_projects_render = selected_shader_projects.clone();
-    let render_shaders_cards_holder: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+    let render_shaders_cards_holder: RenderCallbackHolder = Rc::new(RefCell::new(None));
     let render_shaders_cards_holder_for_init = render_shaders_cards_holder.clone();
     let render_shaders_cards: Rc<dyn Fn()> = Rc::new(move || {
         while let Some(child) = flow_shaders_results_render.first_child() {
             flow_shaders_results_render.remove(&child);
         }
 
-        let mut selected_items: Vec<DiscoveryCardData> =
-            selected_shader_projects_render.borrow().values().cloned().collect();
-        selected_items.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+        let mut selected_items: Vec<DiscoveryCardData> = selected_shader_projects_render
+            .borrow()
+            .values()
+            .cloned()
+            .collect();
+        selected_items.sort_by_key(|item| item.title.to_lowercase());
 
         if !selected_items.is_empty() {
             let selected_header = Label::new(Some("Selected for install"));
@@ -2947,7 +2775,9 @@ fn build_ui(app: &Application) {
                 let project_id = item.project_id.clone();
                 check.connect_toggled(move |c| {
                     if !c.is_active() {
-                        selected_shader_projects_toggle.borrow_mut().remove(&project_id);
+                        selected_shader_projects_toggle
+                            .borrow_mut()
+                            .remove(&project_id);
                         if let Some(render) = render_shaders_cards_toggle.borrow().as_ref() {
                             (render)();
                         }
@@ -3100,13 +2930,12 @@ fn build_ui(app: &Application) {
                         &file_name,
                         value,
                     ) {
-                        let _ = tx_toggle.send(LauncherMessage::TaskFailed(e));
+                        let _ = tx_toggle.send(AppEvent::discovery_failed(DiscoveryKind::Mods, e));
                         sw.set_active(!value);
                     } else {
                         sw.set_active(value);
-                        let _ = tx_toggle.send(LauncherMessage::DiscoveryInstalledChanged(
-                            DiscoveryKind::Mods,
-                        ));
+                        let _ = tx_toggle
+                            .send(AppEvent::discovery_installed_changed(DiscoveryKind::Mods));
                     }
                     glib::Propagation::Stop
                 });
@@ -3118,11 +2947,10 @@ fn build_ui(app: &Application) {
                     if let Err(e) =
                         delete_profile_content(&profile_for_delete, DiscoveryKind::Mods, &file_name)
                     {
-                        let _ = tx_delete.send(LauncherMessage::TaskFailed(e));
+                        let _ = tx_delete.send(AppEvent::discovery_failed(DiscoveryKind::Mods, e));
                     } else {
-                        let _ = tx_delete.send(LauncherMessage::DiscoveryInstalledChanged(
-                            DiscoveryKind::Mods,
-                        ));
+                        let _ = tx_delete
+                            .send(AppEvent::discovery_installed_changed(DiscoveryKind::Mods));
                     }
                 });
             } else {
@@ -3195,11 +3023,12 @@ fn build_ui(app: &Application) {
                         &file_name,
                         value,
                     ) {
-                        let _ = tx_toggle.send(LauncherMessage::TaskFailed(e));
+                        let _ =
+                            tx_toggle.send(AppEvent::discovery_failed(DiscoveryKind::Shaders, e));
                         sw.set_active(!value);
                     } else {
                         sw.set_active(value);
-                        let _ = tx_toggle.send(LauncherMessage::DiscoveryInstalledChanged(
+                        let _ = tx_toggle.send(AppEvent::discovery_installed_changed(
                             DiscoveryKind::Shaders,
                         ));
                     }
@@ -3215,9 +3044,10 @@ fn build_ui(app: &Application) {
                         DiscoveryKind::Shaders,
                         &file_name,
                     ) {
-                        let _ = tx_delete.send(LauncherMessage::TaskFailed(e));
+                        let _ =
+                            tx_delete.send(AppEvent::discovery_failed(DiscoveryKind::Shaders, e));
                     } else {
-                        let _ = tx_delete.send(LauncherMessage::DiscoveryInstalledChanged(
+                        let _ = tx_delete.send(AppEvent::discovery_installed_changed(
                             DiscoveryKind::Shaders,
                         ));
                     }
@@ -3516,8 +3346,13 @@ fn build_ui(app: &Application) {
                 }
 
                 dropdown_profile_runtime_java_policy_refresh.set_sensitive(true);
-                dropdown_profile_runtime_java_policy_refresh
-                    .set_selected(if selected_profile.java_auto_download { 0 } else { 1 });
+                dropdown_profile_runtime_java_policy_refresh.set_selected(
+                    if selected_profile.java_auto_download {
+                        0
+                    } else {
+                        1
+                    },
+                );
                 row_java_binary_refresh.set_sensitive(true);
                 row_java_binary_refresh
                     .set_text(selected_profile.java_binary.as_deref().unwrap_or(""));
@@ -3672,8 +3507,11 @@ fn build_ui(app: &Application) {
                     row_profile_loader_version_exact_sync.set_text("");
                 }
             }
-            dropdown_profile_runtime_java_policy_sync
-                .set_selected(if profile.java_auto_download { 0 } else { 1 });
+            dropdown_profile_runtime_java_policy_sync.set_selected(if profile.java_auto_download {
+                0
+            } else {
+                1
+            });
             row_java_binary_sync.set_text(profile.java_binary.as_deref().unwrap_or(""));
             row_profile_runtime_memory_mb_sync.set_text(
                 &profile
@@ -3821,9 +3659,16 @@ fn build_ui(app: &Application) {
             None
         };
 
-        let java_memory_mb = match parse_optional_u32(&row_profile_runtime_memory_mb_create.text()) {
+        let java_memory_mb = match parse_optional_u32(&row_profile_runtime_memory_mb_create.text())
+        {
             Some(v) => Some(v),
-            None if row_profile_runtime_memory_mb_create.text().trim().is_empty() => None,
+            None if row_profile_runtime_memory_mb_create
+                .text()
+                .trim()
+                .is_empty() =>
+            {
+                None
+            }
             None => {
                 lbl_status_create.set_label("Memory limit must be an integer MB value");
                 return;
@@ -3831,6 +3676,7 @@ fn build_ui(app: &Application) {
         };
 
         profiles_create.borrow_mut().push(LauncherProfile {
+            id: storage::new_profile_id(),
             name: name.clone(),
             version_id,
             loader,
@@ -4093,7 +3939,7 @@ fn build_ui(app: &Application) {
             _ => {
                 row_status_ms.set_subtitle("Microsoft login unavailable: set LUCENT_MS_CLIENT_ID");
                 lbl_status_ms.set_label("Microsoft client ID missing");
-                let _ = tx_ms.send(LauncherMessage::Log(
+                let _ = tx_ms.send(AppEvent::Log(
                     "Set environment variable LUCENT_MS_CLIENT_ID before launching Lucent."
                         .to_string(),
                 ));
@@ -4109,7 +3955,7 @@ fn build_ui(app: &Application) {
     if let Ok(client_id) = std::env::var(MS_CLIENT_ID_ENV) {
         match load_saved_refresh_token() {
             Ok(Some(refresh_token)) => {
-                let _ = tx.send(LauncherMessage::Log(
+                let _ = tx.send(AppEvent::Log(
                     "Found stored Microsoft session; attempting automatic restore...".to_string(),
                 ));
                 btn_login_microsoft.set_sensitive(false);
@@ -4117,7 +3963,7 @@ fn build_ui(app: &Application) {
             }
             Ok(None) => {}
             Err(e) => {
-                let _ = tx.send(LauncherMessage::Log(format!(
+                let _ = tx.send(AppEvent::Log(format!(
                     "[WARN] Could not read keyring token: {e}"
                 )));
             }
@@ -4145,7 +3991,7 @@ fn build_ui(app: &Application) {
         view_stack_switch.set_visible_child_name("page_account");
 
         if let Err(e) = clear_refresh_token() {
-            let _ = tx_switch.send(LauncherMessage::Log(format!(
+            let _ = tx_switch.send(AppEvent::Log(format!(
                 "[WARN] Failed to clear saved Microsoft token: {e}"
             )));
         }
@@ -4209,31 +4055,30 @@ fn build_ui(app: &Application) {
             mods_results_for_vanilla_clear.borrow_mut().clear();
             selected_mods_for_vanilla_clear.borrow_mut().clear();
             (render_mods_cards_for_vanilla_clear)();
-            lbl_mods_results_status_click.set_label(
-                "Selected profile uses Vanilla loader: mods are incompatible",
-            );
+            lbl_mods_results_status_click
+                .set_label("Selected profile uses Vanilla loader: mods are incompatible");
             return;
         }
 
         lbl_mods_results_status_click.set_label("Searching Modrinth…");
         let tx = tx_mods_search.clone();
-        thread::spawn(
-            move || match fetch_modrinth_projects(DiscoveryKind::Mods, &query, Some(&profile)) {
+        thread::spawn(move || {
+            match fetch_modrinth_projects(DiscoveryKind::Mods, &query, Some(&profile)) {
                 Ok(results) => {
-                    let _ = tx.send(LauncherMessage::DiscoverySearchResults {
-                        kind: DiscoveryKind::Mods,
+                    let _ = tx.send(AppEvent::discovery_search_results(
+                        DiscoveryKind::Mods,
                         query,
                         results,
-                    });
+                    ));
                 }
                 Err(error) => {
-                    let _ = tx.send(LauncherMessage::DiscoverySearchFailed {
-                        kind: DiscoveryKind::Mods,
+                    let _ = tx.send(AppEvent::discovery_search_failed(
+                        DiscoveryKind::Mods,
                         error,
-                    });
+                    ));
                 }
-            },
-        );
+            }
+        });
     });
 
     let btn_mods_search_activate = btn_profile_mods_search.clone();
@@ -4264,8 +4109,9 @@ fn build_ui(app: &Application) {
             .cloned()
             .collect();
         if selected_projects.is_empty() {
-            let _ = tx_mods_install.send(LauncherMessage::TaskFailed(
-                "Select one or more mods to install".to_string(),
+            let _ = tx_mods_install.send(AppEvent::discovery_failed(
+                DiscoveryKind::Mods,
+                "Select one or more mods to install",
             ));
             return;
         }
@@ -4274,8 +4120,9 @@ fn build_ui(app: &Application) {
         launch_dropdown_for_mods_install.set_selected(profile_idx as u32);
         let profile = profiles_mods_install.borrow().get(profile_idx).cloned();
         let Some(profile) = profile else {
-            let _ = tx_mods_install.send(LauncherMessage::TaskFailed(
-                "Select a valid profile in Profile Editor".to_string(),
+            let _ = tx_mods_install.send(AppEvent::discovery_failed(
+                DiscoveryKind::Mods,
+                "Select a valid profile in Profile Editor",
             ));
             return;
         };
@@ -4288,27 +4135,25 @@ fn build_ui(app: &Application) {
                 match install_modrinth_project(DiscoveryKind::Mods, &project, &profile) {
                     Ok(path) => {
                         installed_count += 1;
-                        let _ = tx.send(LauncherMessage::DiscoveryInstallFinished {
-                            kind: DiscoveryKind::Mods,
-                            title: project.title,
-                            target_path: path.to_string_lossy().to_string(),
-                        });
+                        let _ = tx.send(AppEvent::discovery_install_finished(
+                            DiscoveryKind::Mods,
+                            project.title,
+                            path.to_string_lossy().to_string(),
+                        ));
                     }
                     Err(error) => {
-                        let _ = tx.send(LauncherMessage::TaskFailed(format!(
-                            "Failed to install mod '{}': {}",
-                            project.title, error
-                        )));
+                        let _ = tx.send(AppEvent::discovery_failed(
+                            DiscoveryKind::Mods,
+                            format!("Failed to install mod '{}': {}", project.title, error),
+                        ));
                     }
                 }
             }
-            let _ = tx.send(LauncherMessage::StatusUpdate(format!(
+            let _ = tx.send(AppEvent::StatusUpdate(format!(
                 "Installed {} mod(s) for '{}'",
                 installed_count, profile.name
             )));
-            let _ = tx.send(LauncherMessage::DiscoveryInstalledChanged(
-                DiscoveryKind::Mods,
-            ));
+            let _ = tx.send(AppEvent::discovery_installed_changed(DiscoveryKind::Mods));
         });
     });
 
@@ -4323,23 +4168,23 @@ fn build_ui(app: &Application) {
         }
         lbl_shaders_results_status_click.set_label("Searching Modrinth…");
         let tx = tx_shaders_search.clone();
-        thread::spawn(
-            move || match fetch_modrinth_projects(DiscoveryKind::Shaders, &query, None) {
+        thread::spawn(move || {
+            match fetch_modrinth_projects(DiscoveryKind::Shaders, &query, None) {
                 Ok(results) => {
-                    let _ = tx.send(LauncherMessage::DiscoverySearchResults {
-                        kind: DiscoveryKind::Shaders,
+                    let _ = tx.send(AppEvent::discovery_search_results(
+                        DiscoveryKind::Shaders,
                         query,
                         results,
-                    });
+                    ));
                 }
                 Err(error) => {
-                    let _ = tx.send(LauncherMessage::DiscoverySearchFailed {
-                        kind: DiscoveryKind::Shaders,
+                    let _ = tx.send(AppEvent::discovery_search_failed(
+                        DiscoveryKind::Shaders,
                         error,
-                    });
+                    ));
                 }
-            },
-        );
+            }
+        });
     });
 
     let btn_shaders_search_activate = btn_profile_shaders_search.clone();
@@ -4370,8 +4215,9 @@ fn build_ui(app: &Application) {
             .cloned()
             .collect();
         if selected_projects.is_empty() {
-            let _ = tx_shaders_install.send(LauncherMessage::TaskFailed(
-                "Select one or more shaderpacks to install".to_string(),
+            let _ = tx_shaders_install.send(AppEvent::discovery_failed(
+                DiscoveryKind::Shaders,
+                "Select one or more shaderpacks to install",
             ));
             return;
         }
@@ -4380,8 +4226,9 @@ fn build_ui(app: &Application) {
         launch_dropdown_for_shaders_install.set_selected(profile_idx as u32);
         let profile = profiles_shaders_install.borrow().get(profile_idx).cloned();
         let Some(profile) = profile else {
-            let _ = tx_shaders_install.send(LauncherMessage::TaskFailed(
-                "Select a valid profile in Profile Editor".to_string(),
+            let _ = tx_shaders_install.send(AppEvent::discovery_failed(
+                DiscoveryKind::Shaders,
+                "Select a valid profile in Profile Editor",
             ));
             return;
         };
@@ -4394,32 +4241,36 @@ fn build_ui(app: &Application) {
                 match install_modrinth_project(DiscoveryKind::Shaders, &project, &profile) {
                     Ok(path) => {
                         installed_count += 1;
-                        let _ = tx.send(LauncherMessage::DiscoveryInstallFinished {
-                            kind: DiscoveryKind::Shaders,
-                            title: project.title,
-                            target_path: path.to_string_lossy().to_string(),
-                        });
+                        let _ = tx.send(AppEvent::discovery_install_finished(
+                            DiscoveryKind::Shaders,
+                            project.title,
+                            path.to_string_lossy().to_string(),
+                        ));
                     }
                     Err(error) => {
-                        let _ = tx.send(LauncherMessage::TaskFailed(format!(
-                            "Failed to install shader '{}': {}",
-                            project.title, error
-                        )));
+                        let _ = tx.send(AppEvent::discovery_failed(
+                            DiscoveryKind::Shaders,
+                            format!("Failed to install shader '{}': {}", project.title, error),
+                        ));
                     }
                 }
             }
-            let _ = tx.send(LauncherMessage::StatusUpdate(format!(
+            let _ = tx.send(AppEvent::StatusUpdate(format!(
                 "Installed {} shaderpack(s) for '{}'",
                 installed_count, profile.name
             )));
-            let _ = tx.send(LauncherMessage::DiscoveryInstalledChanged(
+            let _ = tx.send(AppEvent::discovery_installed_changed(
                 DiscoveryKind::Shaders,
             ));
         });
     });
 
-    // Tracks whether a launch pipeline is currently running.
+    // Track launch preparation separately from ready game processes so multiple
+    // profiles can be launched without losing the aggregate running status.
     let task_active = Rc::new(Cell::new(false));
+    let game_running = Rc::new(Cell::new(false));
+    let pending_launches = Rc::new(RefCell::new(HashSet::<String>::new()));
+    let running_profile_ids = Rc::new(RefCell::new(HashSet::<String>::new()));
 
     // UI-Safe Background Polling Task (Runs every 50ms on the main GUI loop)
     let btn_play_clone = btn_play.clone();
@@ -4430,12 +4281,16 @@ fn build_ui(app: &Application) {
     let lbl_welcome_clone = lbl_welcome_user.clone();
     let row_status_clone = row_account_status.clone();
     let progress_bar_clone = progress_bar.clone();
+    let lbl_progress_clone = lbl_progress.clone();
     let versions_poll = available_versions.clone();
     let profiles_poll = profiles.clone();
     let refresh_profiles_poll = refresh_profile_models.clone();
     let view_stack_poll = view_stack.clone();
     let current_session_poll = current_session.clone();
     let task_active_poll = task_active.clone();
+    let game_running_poll = game_running.clone();
+    let pending_launches_poll = pending_launches.clone();
+    let running_profile_ids_poll = running_profile_ids.clone();
     let render_home_cards_poll = render_home_cards.clone();
     let mods_results_poll = mods_results.clone();
     let shaders_results_poll = shaders_results.clone();
@@ -4452,7 +4307,7 @@ fn build_ui(app: &Application) {
         while let Ok(msg) = rx.try_recv() {
             let buffer = text_view_clone.buffer();
             match msg {
-                LauncherMessage::VersionsLoaded(versions) => {
+                AppEvent::Versions(VersionsEvent::Loaded(versions)) => {
                     if versions.is_empty() {
                         lbl_status_clone.set_label("No versions available");
                     } else {
@@ -4484,12 +4339,12 @@ fn build_ui(app: &Application) {
                                 }
                             }
 
-                            if migrated {
-                                if let Err(e) = save_profiles_to_disk(&profiles_poll.borrow()) {
-                                    buffer.insert_at_cursor(&format!(
-                                        "[WARN] Failed saving migrated profiles: {e}\n"
-                                    ));
-                                }
+                            if migrated
+                                && let Err(e) = save_profiles_to_disk(&profiles_poll.borrow())
+                            {
+                                buffer.insert_at_cursor(&format!(
+                                    "[WARN] Failed saving migrated profiles: {e}\n"
+                                ));
                             }
                         }
 
@@ -4498,44 +4353,128 @@ fn build_ui(app: &Application) {
                             .set_label(&format!("{} versions available", versions.len()));
                     }
                 }
-                LauncherMessage::Log(text) => {
+                AppEvent::Versions(VersionsEvent::Failed(error)) => {
+                    lbl_status_clone.set_label("Failed to load Minecraft versions");
+                    buffer.insert_at_cursor(&format!("[ERROR] {error}\n"));
+                    let mut end = buffer.end_iter();
+                    text_view_clone.scroll_to_iter(&mut end, 0.0, false, 0.0, 1.0);
+                }
+                AppEvent::Log(text) => {
                     buffer.insert_at_cursor(&format!("{text}\n"));
                     let mut end = buffer.end_iter();
                     text_view_clone.scroll_to_iter(&mut end, 0.0, false, 0.0, 1.0);
                 }
-                LauncherMessage::StatusUpdate(status) => {
-                    lbl_status_clone.set_label(&status);
+                AppEvent::StatusUpdate(status) => {
+                    if game_running_poll.get() {
+                        lbl_status_clone.set_label("Game Running");
+                    } else {
+                        lbl_status_clone.set_label(&status);
+                    }
                 }
-                LauncherMessage::TaskFinished => {
-                    lbl_status_clone.set_label("Game Closed / Task Completed");
+                AppEvent::Launch(LaunchEvent::Progress(progress)) => {
+                    // The compact bottom bar presents aggregate progress; readiness and
+                    // completion events still retain profile identity for status tracking.
+                    let _progress_profile_id = progress.profile_id;
+                    let fraction = if let Some(total_bytes) = progress.total_bytes {
+                        if total_bytes > 0 {
+                            progress.bytes_received as f64 / total_bytes as f64
+                        } else {
+                            0.0
+                        }
+                    } else if let Some(total_tasks) = progress.total_tasks {
+                        if total_tasks > 0 {
+                            progress.completed_tasks as f64 / total_tasks as f64
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        0.0
+                    };
+                    if progress.total_bytes.is_some() || progress.total_tasks.is_some() {
+                        progress_bar_clone.set_fraction(fraction.clamp(0.0, 1.0));
+                    }
+                    let label = match progress.current_task {
+                        Some(task) => format!("{} — {}", progress.stage, task),
+                        None => progress.stage,
+                    };
+                    lbl_progress_clone.set_label(&label);
+                    lbl_progress_clone.set_visible(true);
+                }
+                AppEvent::Launch(LaunchEvent::Ready { profile_id }) => {
+                    pending_launches_poll.borrow_mut().remove(&profile_id);
+                    running_profile_ids_poll.borrow_mut().insert(profile_id);
+                    game_running_poll.set(true);
+                    task_active_poll.set(!pending_launches_poll.borrow().is_empty());
+                    progress_bar_clone.set_fraction(1.0);
+                    lbl_progress_clone.set_label("Game Running");
+                    lbl_progress_clone.set_visible(true);
+                    lbl_status_clone.set_label("Game Running");
                     btn_play_clone.set_sensitive(
                         current_session_poll.borrow().is_some()
                             && !profiles_poll.borrow().is_empty(),
                     );
-                    task_active_poll.set(false);
-                    progress_bar_clone.set_visible(false);
-                    progress_bar_clone.set_fraction(0.0);
-                    let selected_idx = launch_dropdown_poll.selected() as usize;
-                    let profile = profiles_poll.borrow().get(selected_idx).cloned();
-                    apply_launch_profile_style(&launch_progress_css_poll, profile.as_ref());
                 }
-                LauncherMessage::TaskFailed(err) => {
-                    lbl_status_clone.set_label("Execution Error!");
-                    buffer.insert_at_cursor(&format!("[ERROR] {err}\n"));
+                AppEvent::Launch(LaunchEvent::Finished { profile_id }) => {
+                    running_profile_ids_poll.borrow_mut().remove(&profile_id);
+                    pending_launches_poll.borrow_mut().remove(&profile_id);
+                    let another_game_running = !running_profile_ids_poll.borrow().is_empty();
+                    let another_launch_pending = !pending_launches_poll.borrow().is_empty();
+                    game_running_poll.set(another_game_running);
+                    task_active_poll.set(another_launch_pending);
+                    btn_play_clone.set_sensitive(
+                        current_session_poll.borrow().is_some()
+                            && !profiles_poll.borrow().is_empty(),
+                    );
+                    if another_game_running {
+                        lbl_status_clone.set_label("Game Running");
+                        progress_bar_clone.set_fraction(1.0);
+                        lbl_progress_clone.set_label("Game Running");
+                        lbl_progress_clone.set_visible(true);
+                    } else if !another_launch_pending {
+                        lbl_status_clone.set_label("Game Closed / Task Completed");
+                        progress_bar_clone.set_visible(false);
+                        progress_bar_clone.set_fraction(0.0);
+                        lbl_progress_clone.set_label("");
+                        lbl_progress_clone.set_visible(false);
+                        let selected_idx = launch_dropdown_poll.selected() as usize;
+                        let profile = profiles_poll.borrow().get(selected_idx).cloned();
+                        apply_launch_profile_style(&launch_progress_css_poll, profile.as_ref());
+                    }
+                }
+                AppEvent::Launch(LaunchEvent::Failed { profile_id, error }) => {
+                    running_profile_ids_poll.borrow_mut().remove(&profile_id);
+                    pending_launches_poll.borrow_mut().remove(&profile_id);
+                    let another_game_running = !running_profile_ids_poll.borrow().is_empty();
+                    let another_launch_pending = !pending_launches_poll.borrow().is_empty();
+                    game_running_poll.set(another_game_running);
+                    task_active_poll.set(another_launch_pending);
+                    lbl_status_clone.set_label(if another_game_running {
+                        "Game Running"
+                    } else {
+                        "Execution Error!"
+                    });
+                    buffer.insert_at_cursor(&format!("[ERROR] {error}\n"));
                     let mut end = buffer.end_iter();
                     text_view_clone.scroll_to_iter(&mut end, 0.0, false, 0.0, 1.0);
                     btn_play_clone.set_sensitive(
                         current_session_poll.borrow().is_some()
                             && !profiles_poll.borrow().is_empty(),
                     );
-                    task_active_poll.set(false);
-                    progress_bar_clone.set_visible(false);
-                    progress_bar_clone.set_fraction(0.0);
-                    let selected_idx = launch_dropdown_poll.selected() as usize;
-                    let profile = profiles_poll.borrow().get(selected_idx).cloned();
-                    apply_launch_profile_style(&launch_progress_css_poll, profile.as_ref());
+                    if another_game_running {
+                        progress_bar_clone.set_fraction(1.0);
+                        lbl_progress_clone.set_label("Game Running");
+                        lbl_progress_clone.set_visible(true);
+                    } else if !another_launch_pending {
+                        progress_bar_clone.set_visible(false);
+                        progress_bar_clone.set_fraction(0.0);
+                        lbl_progress_clone.set_label("");
+                        lbl_progress_clone.set_visible(false);
+                        let selected_idx = launch_dropdown_poll.selected() as usize;
+                        let profile = profiles_poll.borrow().get(selected_idx).cloned();
+                        apply_launch_profile_style(&launch_progress_css_poll, profile.as_ref());
+                    }
                 }
-                LauncherMessage::OpenUrl(url) => {
+                AppEvent::OpenUrl(url) => {
                     if let Err(e) = gtk::gio::AppInfo::launch_default_for_uri(
                         &url,
                         None::<&gtk::gio::AppLaunchContext>,
@@ -4547,11 +4486,17 @@ fn build_ui(app: &Application) {
                     let mut end = buffer.end_iter();
                     text_view_clone.scroll_to_iter(&mut end, 0.0, false, 0.0, 1.0);
                 }
-                LauncherMessage::DiscoverySearchResults {
+                AppEvent::Discovery(DiscoveryEvent::ActionFailed { kind, error }) => {
+                    lbl_status_clone.set_label(&format!("{} action failed", kind.label()));
+                    buffer.insert_at_cursor(&format!("[ERROR] {}: {}\n", kind.label(), error));
+                    let mut end = buffer.end_iter();
+                    text_view_clone.scroll_to_iter(&mut end, 0.0, false, 0.0, 1.0);
+                }
+                AppEvent::Discovery(DiscoveryEvent::SearchResults {
                     kind,
                     query,
                     results,
-                } => {
+                }) => {
                     let count = results.len();
                     match kind {
                         DiscoveryKind::Mods => {
@@ -4568,7 +4513,7 @@ fn build_ui(app: &Application) {
                         }
                     }
                 }
-                LauncherMessage::DiscoverySearchFailed { kind, error } => {
+                AppEvent::Discovery(DiscoveryEvent::SearchFailed { kind, error }) => {
                     match kind {
                         DiscoveryKind::Mods => {
                             lbl_mods_results_status_poll
@@ -4585,11 +4530,11 @@ fn build_ui(app: &Application) {
                         error
                     ));
                 }
-                LauncherMessage::DiscoveryInstallFinished {
+                AppEvent::Discovery(DiscoveryEvent::InstallFinished {
                     kind,
                     title,
                     target_path,
-                } => {
+                }) => {
                     lbl_status_clone.set_label(&format!("{} installed", kind.label()));
                     buffer.insert_at_cursor(&format!("Installed '{}' to {}\n", title, target_path));
                     match kind {
@@ -4599,16 +4544,16 @@ fn build_ui(app: &Application) {
                     let mut end = buffer.end_iter();
                     text_view_clone.scroll_to_iter(&mut end, 0.0, false, 0.0, 1.0);
                 }
-                LauncherMessage::DiscoveryInstalledChanged(kind) => match kind {
+                AppEvent::Discovery(DiscoveryEvent::InstalledChanged(kind)) => match kind {
                     DiscoveryKind::Mods => (refresh_mods_installed_poll)(),
                     DiscoveryKind::Shaders => (refresh_shaders_installed_poll)(),
                 },
-                LauncherMessage::MicrosoftAuthSuccess {
+                AppEvent::Auth(AuthEvent::MicrosoftSuccess {
                     username,
                     uuid,
                     access_token,
                     refresh_token,
-                } => {
+                }) => {
                     *current_session_poll.borrow_mut() = Some(Session::Microsoft {
                         username: username.clone(),
                         uuid,
@@ -4625,7 +4570,7 @@ fn build_ui(app: &Application) {
                     view_stack_poll.set_visible_child_name("page_home");
                     (render_home_cards_poll)();
                 }
-                LauncherMessage::MicrosoftAuthFailed(err) => {
+                AppEvent::Auth(AuthEvent::MicrosoftFailed(err)) => {
                     lbl_status_clone.set_label("Microsoft sign-in failed");
                     buffer.insert_at_cursor(&format!("[ERROR] {err}\n"));
                     row_status_clone.set_subtitle("Not signed in");
@@ -4634,10 +4579,6 @@ fn build_ui(app: &Application) {
                     text_view_clone.scroll_to_iter(&mut end, 0.0, false, 0.0, 1.0);
                 }
             }
-        }
-
-        if task_active_poll.get() {
-            progress_bar_clone.pulse();
         }
 
         glib::ControlFlow::Continue
@@ -4649,10 +4590,16 @@ fn build_ui(app: &Application) {
     let profiles_launch = profiles.clone();
 
     let progress_bar_launch = progress_bar.clone();
+    let lbl_progress_launch = lbl_progress.clone();
     let task_active_launch = task_active.clone();
+    let pending_launches_launch = pending_launches.clone();
     let launch_progress_css_launch = launch_progress_css.clone();
 
     btn_play.connect_clicked(move |button| {
+        if task_active_launch.get() {
+            return;
+        }
+
         let session = match current_session_launch.borrow().clone() {
             Some(session) => session,
             None => return,
@@ -4662,8 +4609,9 @@ fn build_ui(app: &Application) {
 
         task_active_launch.set(true);
         progress_bar_launch.set_fraction(0.0);
+        lbl_progress_launch.set_label("Preparing launch…");
+        lbl_progress_launch.set_visible(true);
         progress_bar_launch.set_visible(true);
-        progress_bar_launch.pulse();
 
         let selected_profile_idx = launch_profile_dropdown.selected() as usize;
         let selected_profile = {
@@ -4674,12 +4622,17 @@ fn build_ui(app: &Application) {
                     button.set_sensitive(true);
                     task_active_launch.set(false);
                     progress_bar_launch.set_visible(false);
+                    lbl_progress_launch.set_label("");
+                    lbl_progress_launch.set_visible(false);
                     apply_launch_profile_style(&launch_progress_css_launch, None);
                     return;
                 }
             }
         };
         apply_launch_profile_style(&launch_progress_css_launch, Some(&selected_profile));
+        pending_launches_launch
+            .borrow_mut()
+            .insert(selected_profile.id.clone());
         let target_version = selected_profile.version_id.clone();
 
         if !available_versions
@@ -4687,14 +4640,19 @@ fn build_ui(app: &Application) {
             .iter()
             .any(|v| v == &target_version)
         {
-            let _ = tx.send(LauncherMessage::TaskFailed(format!(
-                "Profile '{}' references unsupported Minecraft version '{}'. Open Profile Editor and choose a valid version.",
-                selected_profile.name, target_version
-            )));
+            let _ = tx.send(AppEvent::launch_failed(
+                selected_profile.id.clone(),
+                format!(
+                    "Profile '{}' references unsupported Minecraft version '{}'. Open Profile Editor and choose a valid version.",
+                    selected_profile.name, target_version
+                ),
+            ));
             button.set_sensitive(true);
             task_active_launch.set(false);
             progress_bar_launch.set_visible(false);
             progress_bar_launch.set_fraction(0.0);
+            lbl_progress_launch.set_label("");
+            lbl_progress_launch.set_visible(false);
             apply_launch_profile_style(&launch_progress_css_launch, Some(&selected_profile));
             return;
         }
@@ -4712,529 +4670,14 @@ fn build_ui(app: &Application) {
         };
 
         let thread_tx = tx.clone();
-
         thread::spawn(move || {
-            use mc_launcher_core::account::Account;
-            use mc_launcher_core::prelude::*;
-
-            let mut effective_session = session;
-            if let Session::Microsoft {
-                refresh_token,
-                username,
-                ..
-            } = &effective_session
-            {
-                if let Ok(client_id) = std::env::var(MS_CLIENT_ID_ENV) {
-                    let _ = thread_tx.send(LauncherMessage::Log(format!(
-                        "Refreshing Microsoft access token for {username}..."
-                    )));
-                    match complete_microsoft_refresh_resilient(&client_id, refresh_token) {
-                        Ok((fresh_username, fresh_uuid, fresh_access_token, fresh_refresh_token)) => {
-                            if let Err(e) = save_refresh_token(&fresh_refresh_token) {
-                                let _ = thread_tx.send(LauncherMessage::Log(format!(
-                                    "[WARN] Failed updating stored refresh token: {e}"
-                                )));
-                            }
-                            effective_session = Session::Microsoft {
-                                username: fresh_username,
-                                uuid: fresh_uuid,
-                                access_token: fresh_access_token,
-                                refresh_token: fresh_refresh_token,
-                            };
-                        }
-                        Err(e) => {
-                            let _ = thread_tx.send(LauncherMessage::TaskFailed(format!(
-                                "Microsoft token refresh failed before launch: {e}"
-                            )));
-                            return;
-                        }
-                    }
-                } else {
-                    let _ = thread_tx.send(LauncherMessage::Log(
-                        "[WARN] LUCENT_MS_CLIENT_ID missing; using existing Microsoft token".to_string(),
-                    ));
-                }
-            }
-
-            thread_tx
-                .send(LauncherMessage::StatusUpdate(format!(
-                    "Preparing {} ({})",
-                    selected_profile.name, target_version
-                )))
-                .unwrap();
-            thread_tx
-                .send(LauncherMessage::Log(format!(
-                    "Initializing launch pipeline for user: {} (profile: {})",
-                    effective_session.display_name(),
-                    selected_profile.name
-                )))
-                .unwrap();
-
-            let preferred_java = match resolve_preferred_java_executable(&java_path_raw) {
-                Ok(java) => java,
-                Err(e) => {
-                    let _ = thread_tx.send(LauncherMessage::TaskFailed(format!(
-                        "Java configuration error: {}",
-                        e
-                    )));
-                    return;
-                }
-            };
-            if let Some(java) = &preferred_java {
-                let _ = thread_tx.send(LauncherMessage::Log(format!(
-                    "Using Java executable: {}",
-                    java.display()
-                )));
-            } else {
-                let _ = thread_tx.send(LauncherMessage::Log(
-                    "No explicit Java binary configured; relying on launcher/runtime defaults"
-                        .to_string(),
-                ));
-            }
-
-            let mc_dir = match minecraft_root_dir() {
-                Ok(path) => path,
-                Err(e) => {
-                    let _ = thread_tx.send(LauncherMessage::TaskFailed(format!(
-                        "Failed resolving runtime minecraft directory: {e}"
-                    )));
-                    return;
-                }
-            };
-            let launcher = Launcher::new(mc_dir);
-
-            thread_tx
-                .send(LauncherMessage::Log(format!(
-                    "Checking manifests and installing profile: MC={}, Loader={}, LoaderVersion={}",
-                    selected_profile.version_id,
-                    selected_profile.loader_label(),
-                    selected_profile.loader_version_label()
-                )))
-                .unwrap();
-
-            let resolved_forge_version = match (&selected_profile.loader, &selected_profile.loader_version) {
-                (ProfileLoader::Forge, ProfileLoaderVersion::LatestStable)
-                | (ProfileLoader::Forge, ProfileLoaderVersion::Latest) => {
-                    match resolve_latest_forge_version_for_minecraft(&selected_profile.version_id) {
-                        Ok(forge_version) => {
-                            let _ = thread_tx.send(LauncherMessage::Log(format!(
-                                "Resolved Forge version for {} -> {}",
-                                selected_profile.version_id, forge_version
-                            )));
-                            Some(forge_version)
-                        }
-                        Err(e) => {
-                            let _ = thread_tx.send(LauncherMessage::TaskFailed(e));
-                            return;
-                        }
-                    }
-                }
-                (ProfileLoader::Forge, ProfileLoaderVersion::Exact(v)) => Some(v.clone()),
-                _ => None,
-            };
-
-            let installed_version_id = if let Some(forge_version) = resolved_forge_version {
-                let _ = thread_tx.send(LauncherMessage::Log(
-                    "Starting Forge installation pipeline (this can take a few minutes)..."
-                        .to_string(),
-                ));
-                let install_progress = spawn_progress_heartbeat(
-                    &thread_tx,
-                    "Forge installation",
-                    Duration::from_secs(12),
-                );
-                let forge_java_path = preferred_java
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|| java_path_raw.clone());
-                let install_result = install_forge_profile_with_java(
-                    &launcher,
-                    &selected_profile.version_id,
-                    &forge_version,
-                    &forge_java_path,
-                    selected_profile.java_auto_download,
-                    &thread_tx,
-                );
-                install_progress.store(false, Ordering::Relaxed);
-
-                match install_result {
-                    Ok(version_id) => version_id,
-                    Err(e) => {
-                        let _ = thread_tx.send(LauncherMessage::TaskFailed(format!(
-                            "Installation pipeline aborted: {}",
-                            e
-                        )));
-                        return;
-                    }
-                }
-            } else {
-                let loader_spec = match (&selected_profile.loader, &selected_profile.loader_version) {
-                    (ProfileLoader::Vanilla, _) => None,
-                    (ProfileLoader::Fabric, ProfileLoaderVersion::LatestStable) => {
-                        Some(LoaderSpec::Fabric { version: LoaderVersion::LatestStable })
-                    }
-                    (ProfileLoader::Fabric, ProfileLoaderVersion::Latest) => {
-                        Some(LoaderSpec::Fabric { version: LoaderVersion::Latest })
-                    }
-                    (ProfileLoader::Fabric, ProfileLoaderVersion::Exact(v)) => {
-                        Some(LoaderSpec::Fabric { version: LoaderVersion::Exact(v.clone()) })
-                    }
-                    (ProfileLoader::Quilt, ProfileLoaderVersion::LatestStable) => {
-                        Some(LoaderSpec::Quilt { version: LoaderVersion::LatestStable })
-                    }
-                    (ProfileLoader::Quilt, ProfileLoaderVersion::Latest) => {
-                        Some(LoaderSpec::Quilt { version: LoaderVersion::Latest })
-                    }
-                    (ProfileLoader::Quilt, ProfileLoaderVersion::Exact(v)) => {
-                        Some(LoaderSpec::Quilt { version: LoaderVersion::Exact(v.clone()) })
-                    }
-                    (ProfileLoader::NeoForge, ProfileLoaderVersion::LatestStable) => {
-                        Some(LoaderSpec::NeoForge { version: LoaderVersion::LatestStable })
-                    }
-                    (ProfileLoader::NeoForge, ProfileLoaderVersion::Latest) => {
-                        Some(LoaderSpec::NeoForge { version: LoaderVersion::Latest })
-                    }
-                    (ProfileLoader::NeoForge, ProfileLoaderVersion::Exact(v)) => {
-                        Some(LoaderSpec::NeoForge { version: LoaderVersion::Exact(v.clone()) })
-                    }
-                    (ProfileLoader::Forge, _) => unreachable!("Forge handled in custom installer path"),
-                };
-
-                let install_req = InstallRequest {
-                    minecraft_version: selected_profile.version_id.clone(),
-                    loader: loader_spec,
-                    java: java_install_policy,
-                };
-
-                let _ = thread_tx.send(LauncherMessage::Log(
-                    "Installing Minecraft/loader assets (this can take a few minutes on first run)..."
-                        .to_string(),
-                ));
-                let install_progress = spawn_progress_heartbeat(
-                    &thread_tx,
-                    "Minecraft + loader install",
-                    Duration::from_secs(12),
-                );
-                let install_result = launcher.install(install_req);
-                install_progress.store(false, Ordering::Relaxed);
-
-                match install_result {
-                    Ok(install_res) => install_res.version_id,
-                    Err(e) => {
-                        let _ = thread_tx.send(LauncherMessage::TaskFailed(format!(
-                            "Installation pipeline aborted: {:?}",
-                            e
-                        )));
-                        return;
-                    }
-                }
-            };
-
-            thread_tx
-                .send(LauncherMessage::Log(format!(
-                    "Successfully prepared profile: {}",
-                    installed_version_id
-                )))
-                .unwrap();
-
-            let load_progress = spawn_progress_heartbeat(
-                &thread_tx,
-                "Loading installed version metadata",
-                Duration::from_secs(10),
+            launch_service::LaunchService::run(
+                selected_profile,
+                session,
+                java_path_raw,
+                java_install_policy,
+                thread_tx,
             );
-            let load_result = launcher.load_version(&installed_version_id);
-            load_progress.store(false, Ordering::Relaxed);
-
-            match load_result {
-                Ok(version_meta) => {
-                            if let Err(e) = ensure_maven_fallback_libraries_present(
-                                &version_meta,
-                                launcher.minecraft_dir(),
-                                &thread_tx,
-                            ) {
-                                let _ = thread_tx.send(LauncherMessage::TaskFailed(format!(
-                                    "Failed preparing fallback libraries: {e}"
-                                )));
-                                return;
-                            }
-
-                            let launch_account = match effective_session {
-                                Session::Offline { username } => Account::offline(username),
-                                Session::Microsoft {
-                                    username,
-                                    uuid,
-                                    access_token,
-                                    refresh_token: _,
-                                } => Account::Microsoft {
-                                    username,
-                                    uuid,
-                                    access_token,
-                                },
-                            };
-
-                            let mut options = LaunchOptions {
-                                account: launch_account,
-                                ..Default::default()
-                            };
-
-                            match profile_game_directory(&selected_profile) {
-                                Ok(game_dir) => {
-                                    let _ = thread_tx.send(LauncherMessage::StatusUpdate(
-                                        "Repairing mods".to_string(),
-                                    ));
-
-                                    match auto_repair_profile_mods(&selected_profile, &thread_tx) {
-                                        Ok(summary) => {
-                                            let _ = thread_tx.send(LauncherMessage::Log(format!(
-                                                "Auto-repair summary: checked={}, updated={}, disabled={}, unknown={}",
-                                                summary.checked, summary.updated, summary.disabled, summary.unknown
-                                            )));
-
-                                            if !summary.disabled_mods.is_empty() {
-                                                let _ = thread_tx.send(LauncherMessage::TaskFailed(format!(
-                                                    "Mod repair disabled incompatible mods with no compatible replacements for profile '{}': {}",
-                                                    selected_profile.name,
-                                                    summary.disabled_mods.join(", ")
-                                                )));
-                                                return;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            let _ = thread_tx.send(LauncherMessage::TaskFailed(format!(
-                                                "Failed during mod compatibility auto-repair: {e}"
-                                            )));
-                                            return;
-                                        }
-                                    }
-
-                                    let mods_dir = game_dir.join("mods");
-                                    let shaders_dir = game_dir.join("shaderpacks");
-
-                                    let count_enabled = |dir: &Path| -> usize {
-                                        fs::read_dir(dir)
-                                            .ok()
-                                            .into_iter()
-                                            .flatten()
-                                            .filter_map(|entry| entry.ok())
-                                            .map(|e| e.path())
-                                            .filter(|p| p.is_file())
-                                            .filter(|p| {
-                                                p.file_name()
-                                                    .and_then(|n| n.to_str())
-                                                    .map(|n| !n.ends_with(".disabled"))
-                                                    .unwrap_or(false)
-                                            })
-                                            .count()
-                                    };
-
-                                    let _ = thread_tx.send(LauncherMessage::Log(format!(
-                                        "Using profile game directory: {}",
-                                        game_dir.display()
-                                    )));
-                                    let _ = thread_tx.send(LauncherMessage::Log(format!(
-                                        "Profile content: {} enabled mod(s), {} enabled shaderpack(s)",
-                                        count_enabled(&mods_dir),
-                                        count_enabled(&shaders_dir)
-                                    )));
-
-                                    options.game_directory = Some(game_dir);
-                                }
-                                Err(e) => {
-                                    let _ = thread_tx.send(LauncherMessage::TaskFailed(format!(
-                                        "Failed preparing profile game directory: {e}"
-                                    )));
-                                    return;
-                                }
-                            }
-
-                            let mut launch_java = preferred_java.clone();
-                            if launch_java.is_none() && selected_profile.java_auto_download {
-                                match ensure_runtime_java_for_version(
-                                    launcher.minecraft_dir(),
-                                    &installed_version_id,
-                                    Some(&version_meta),
-                                    &thread_tx,
-                                ) {
-                                    Ok(Some(path)) => launch_java = Some(path),
-                                    Ok(None) => {
-                                        let _ = thread_tx.send(LauncherMessage::Log(
-                                            "No version-specific managed Java runtime metadata found; falling back to system discovery".to_string(),
-                                        ));
-                                    }
-                                    Err(e) => {
-                                        let _ = thread_tx.send(LauncherMessage::TaskFailed(format!(
-                                            "Java runtime auto-install failed: {}",
-                                            e
-                                        )));
-                                        return;
-                                    }
-                                }
-                            }
-
-                            if launch_java.is_none() {
-                                launch_java = discover_java_from_env();
-                            }
-
-                            if let Some(java) = &launch_java {
-                                options.java_executable = Some(java.clone());
-                            }
-
-                            match launcher.build_launch_command_from_version(&version_meta, options) {
-                                Ok(mut launch_cmd) => {
-                                    let injected = apply_profile_runtime_jvm_overrides(
-                                        &mut launch_cmd.args,
-                                        version_meta.main_class.as_deref(),
-                                        selected_profile.java_memory_mb,
-                                        selected_profile.java_args.as_deref(),
-                                    );
-                                    if injected > 0 {
-                                        let _ = thread_tx.send(LauncherMessage::Log(format!(
-                                            "Applied {injected} profile JVM override argument(s)"
-                                        )));
-                                    }
-
-                                    let removed = dedupe_launch_classpath(&mut launch_cmd.args);
-                                    if removed > 0 {
-                                        let _ = thread_tx.send(LauncherMessage::Log(format!(
-                                            "Deduplicated {removed} conflicting library entries from classpath"
-                                        )));
-                                    }
-
-                                    thread_tx
-                                        .send(LauncherMessage::StatusUpdate(
-                                            "Launching Game Engine".into(),
-                                        ))
-                                        .unwrap();
-                                    thread_tx
-                                        .send(LauncherMessage::Log(
-                                            "Spawning Java runtime context process...".into(),
-                                        ))
-                                        .unwrap();
-
-                                    let _ = thread_tx.send(LauncherMessage::Log(format!(
-                                        "Launch command executable: {}",
-                                        launch_cmd.executable.display()
-                                    )));
-
-                                    let spawn_with = |exe: &Path| {
-                                        std::process::Command::new(exe)
-                                            .args(&launch_cmd.args)
-                                            .current_dir(&launch_cmd.working_dir)
-                                            .stdout(Stdio::piped())
-                                            .stderr(Stdio::piped())
-                                            .spawn()
-                                    };
-
-                                    let mut child_res = spawn_with(&launch_cmd.executable);
-                                    if let Err(err) = &child_res {
-                                        if err.kind() == io::ErrorKind::NotFound {
-                                            if let Some(java) = &launch_java {
-                                                if java != &launch_cmd.executable {
-                                                    let _ = thread_tx.send(LauncherMessage::Log(format!(
-                                                        "Launch executable not found; retrying with resolved Java: {}",
-                                                        java.display()
-                                                    )));
-                                                    child_res = spawn_with(java);
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    match child_res {
-                                        Ok(mut child) => {
-                                            thread_tx
-                                                .send(LauncherMessage::StatusUpdate(
-                                                    "Minecraft running".into(),
-                                                ))
-                                                .unwrap();
-
-                                            let stdout_tx = thread_tx.clone();
-                                            let stdout_reader = child.stdout.take().map(|stdout| {
-                                                thread::spawn(move || {
-                                                    let reader = BufReader::new(stdout);
-                                                    for line in reader.lines() {
-                                                        match line {
-                                                            Ok(line) => {
-                                                                let _ = stdout_tx.send(LauncherMessage::Log(line));
-                                                            }
-                                                            Err(e) => {
-                                                                let _ = stdout_tx.send(LauncherMessage::Log(format!(
-                                                                    "[stdout read error] {e}"
-                                                                )));
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                })
-                                            });
-
-                                            let stderr_tx = thread_tx.clone();
-                                            let stderr_reader = child.stderr.take().map(|stderr| {
-                                                thread::spawn(move || {
-                                                    let reader = BufReader::new(stderr);
-                                                    for line in reader.lines() {
-                                                        match line {
-                                                            Ok(line) => {
-                                                                let _ = stderr_tx.send(LauncherMessage::Log(format!(
-                                                                    "[stderr] {line}"
-                                                                )));
-                                                            }
-                                                            Err(e) => {
-                                                                let _ = stderr_tx.send(LauncherMessage::Log(format!(
-                                                                    "[stderr read error] {e}"
-                                                                )));
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                })
-                                            });
-
-                                            match child.wait() {
-                                                Ok(status) => {
-                                                    if let Some(handle) = stdout_reader {
-                                                        let _ = handle.join();
-                                                    }
-                                                    if let Some(handle) = stderr_reader {
-                                                        let _ = handle.join();
-                                                    }
-
-                                                    if status.success() {
-                                                        let _ = thread_tx.send(LauncherMessage::TaskFinished);
-                                                    } else {
-                                                        let _ = thread_tx.send(LauncherMessage::TaskFailed(format!(
-                                                            "Java process exited with status: {status}"
-                                                        )));
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    let _ = thread_tx.send(LauncherMessage::TaskFailed(format!(
-                                                        "Failed waiting for Java process: {e}"
-                                                    )));
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            let _ = thread_tx.send(LauncherMessage::TaskFailed(format!(
-                                                "Failed to spawn Java execution process: {}. Configure a valid Java binary in Profile Editor > Runtime Settings, or keep Runtime Java policy on Auto to download a managed runtime.",
-                                                e
-                                            )));
-                                        }
-                                    }
-                                }
-                                Err(e) => thread_tx
-                                    .send(LauncherMessage::TaskFailed(format!(
-                                        "Launch command compilation failed: {e:?}"
-                                    )))
-                                    .unwrap(),
-                            }
-                        }
-                        Err(e) => thread_tx
-                            .send(LauncherMessage::TaskFailed(format!(
-                                "Failed loading version structural profile: {e:?}"
-                            )))
-                            .unwrap(),
-                    }
         });
     });
 

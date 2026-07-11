@@ -1492,8 +1492,6 @@ dependencies = [
 [[package]]
 name = "mc-launcher-core"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "024e3e0512dda379a52610b4bb94a1538d1b0ce30f28812e417a9c22d512f43a"
 dependencies = [
  "base64",
  "chrono",
